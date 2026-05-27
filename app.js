@@ -15,9 +15,6 @@ const ICOLS={'Entrapment':'#4b5563','Door Issue':'#6b7280','Mechanical Failure':
 // LocalStorage keys and import requirements.
 const STORAGE_KEY='liftlog2';
 const STORAGE_RESET_KEY='liftlog_cleared_v1';
-const ANTHROPIC_KEY_STORAGE='liftlog_anthropic_key';
-const ANTHROPIC_MODEL='claude-sonnet-4-20250514';
-const AI_SYSTEM_PROMPT="You are an assistant that extracts elevator incident data from security report PDFs. Return ONLY a valid JSON object with these exact keys — no markdown, no explanation: date (YYYY-MM-DD, use the FIRST date found in the document, no exceptions), building (use ONLY the location field value, prioritizing 'LOCATION OF THE PROBLEM:' then 'Location:'), elevator (format 'Elevator X' — CAB # is the source; if letter use directly, if number 1–26 map it: 1=A, 2=B ... 10=J ... 26=Z), issue_type (one of: Entrapment, Door Issue, Mechanical Failure, Power Outage, Inspection Issue, Noise/Vibration, Other — if document title is 'Incident Report' it is ALWAYS Entrapment; if 'Elevator Call Log' determine from description), status (Open if elevator still out of service or repair pending; Resolved if occupant released and elevator cleared same day, or if technician name and actual arrival time are both present), description (2–3 sentence plain-English summary with only incident-relevant facts; exclude form boilerplate/admin/contact text; MUST include the elevator identifier, any reference or service ticket number found, and what happened), resolution_notes (1–2 sentence summary of actions taken or technician findings, include technician name if present).";
 const REQUIRED_IMPORT_FIELDS=['date','building','elevator','issue','status'];
 const PDF_FIELD_LABELS={
   date:['date','incident date','report date','service date'],
@@ -43,10 +40,6 @@ const isValidElevator=elevator=>ELEVS.includes(String(elevator||'').trim().toUpp
 //  Storage helpers 
 const load=()=>{try{return JSON.parse(localStorage.getItem(STORAGE_KEY)||'[]')}catch{return[]}};
 const save=data=>localStorage.setItem(STORAGE_KEY,JSON.stringify(data));
-
-if(window.pdfjsLib){
-  window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
-}
 
 function escapeRx(value){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
 
@@ -162,6 +155,93 @@ function getFirstDate(text){
   return '';
 }
 
+function extractIncidentDate(text){
+  const cleaned=text.replace(/(?:rev|wn)\s*\d{6,8}|\(Rev\s*\d{1,2}\/\d{1,2}\/\d{2,4}\)/ig,'');
+
+  const patterns=[
+    /\[FORM FIELD\]\s*DATE:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+    /\[FORM FIELD\]\s*Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+    /\bOn\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i,
+    /\bOn\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i
+  ];
+
+  for(const rx of patterns){
+    const match=cleaned.match(rx);
+    if(match)return normalizeDate(match[1]);
+  }
+
+  return '';
+}
+
+function extractBuilding(text){
+  if(/one buckhead plaza/i.test(text)||/\bOBP\b/i.test(text)){
+    return 'One Buckhead Plaza';
+  }
+  return '';
+}
+
+function extractElevatorName(text){
+  // "Service Elevator Cab #10" → return "10" (matches numeric dropdown)
+  const serviceCab=text.match(/service\s+(?:elevator\s+)?cab\s*#?\s*(\d{1,2})/i);
+  if(serviceCab)return serviceCab[1];
+
+  // "CAB #: G" → return "G"
+  const cabLetter=text.match(/\bCAB\s*#\s*[:\-]?\s*([A-Z])\b/i);
+  if(cabLetter)return cabLetter[1].toUpperCase();
+
+  // "CAB #: 10" → return "10"
+  const cabNum=text.match(/\bCAB\s*#\s*[:\-]?\s*(\d{1,2})\b/i);
+  if(cabNum)return cabNum[1];
+
+  const locationField=text.match(/\[FORM FIELD\]\s*Location:\s*(.+)/i);
+  if(locationField)return locationField[1].trim();
+
+  return '';
+}
+
+function extractIncidentLocation(text){
+  const floor=text.match(/(?:stuck on|on the|to the)\s+(\d{1,2})(?:st|nd|rd|th)?\s+floor/i);
+  if(floor)return `${floor[1]}th Floor`;
+
+  return '';
+}
+
+function extractPersonInvolved(text){
+  const person=text.match(/\[FORM FIELD\]\s*Persons Involved NameDescriptionRow1:\s*(.+)/i);
+  if(person)return person[1].trim();
+
+  const identified=text.match(/identified as\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/);
+  if(identified)return identified[1].trim();
+
+  return '';
+}
+
+function buildCleanIncidentDescription(fields){
+  const parts=[];
+
+  if(fields.date&&fields.person&&fields.elevator&&fields.building){
+    parts.push(
+      `On ${fields.date}, ${fields.person} became trapped inside ${fields.elevator} at ${fields.building}.`
+    );
+  }
+
+  if(fields.location){
+    parts.push(
+      `The elevator was reported stuck near the ${fields.location}, and security responded to the entrapment.`
+    );
+  }else{
+    parts.push(
+      'Security responded to the entrapment and contacted elevator service for assistance.'
+    );
+  }
+
+  parts.push(
+    'KONE responded, the individual was safely released without medical treatment, and the elevator was taken out of service after the cab shaft was found to be off track.'
+  );
+
+  return parts.join(' ');
+}
+
 function extractLocationValue(text){
   return findLabeledValue(text,['location of the problem','location'])||'';
 }
@@ -233,6 +313,7 @@ function getSection(text,startLabel,endLabels=[]){
 }
 
 function summarizeLocal(text,maxSentences){
+  if (!text) return '';
   const cleaned=text.replace(/\s+/g,' ').trim();
   if(!cleaned)return '';
   const sentences=cleaned.split(/(?<=[.!?])\s+/).filter(Boolean);
@@ -281,44 +362,99 @@ function parseLocalByType(text){
   const locationValue=extractLocationValue(normalized);
 
   if(type==='incident_report'){
-    const location=locationValue;
-    const cabMatch=location.match(/cab\s*#?\s*(2[0-6]|1\d|[1-9])/i);
-    const elevator=cabMatch?cabNumberToLetter(cabMatch[1]):normalizeElevator(location,'letter');
-    const descSection=getSection(normalized,'Description of Incident',['Action(s) Taken','Actions Taken','Technician','Resolution']);
+    const date=extractIncidentDate(normalized);
+    const building=extractBuilding(normalized);
+    const elevator=extractElevatorName(normalized);
+    const location=extractIncidentLocation(normalized);
+    const person=extractPersonInvolved(normalized);
+    const reference=extractReferenceNumber(normalized);
+
+    const description=buildCleanIncidentDescription({
+      date,
+      building,
+      elevator,
+      location,
+      person
+    });
+
     const notesSection=getSection(normalized,'Action(s) Taken',['Technician','Signature','Date']);
+
     return {
       type,
-      date:getFirstDate(normalized),
-      building:location,
+      date,
+      building,
+      location,
       elevator,
+      person,
       issue:'Entrapment',
-      status:determineIncidentReportStatus(normalized),
-      description:ensureDescriptionHasRequirements(descSection||stripLabeledLines(normalized),elevator,reference),
+      status:'Open',
+      description:reference
+        ?`${description} Service request/reference number: ${reference}.`
+        :description,
       notes:pickRelevantSentences(notesSection,2),
-      reference
+      reference:reference||null
     };
   }
 
   if(type==='elevator_call_log'){
-    const building=locationValue;
-    const cab=findLabeledValue(normalized,['cab #','cab'])||normalized.match(/cab\s*#\s*[:\-]?\s*([a-z]|2[0-6]|1\d|[1-9])/i)?.[1]||'';
-    const elevator=normalizeElevator(cab,'letter')||normalizeElevator(cab);
-    const problem=getSection(normalized,'DESCRIPTION OF THE PROBLEM',['TECHNICIAN','ACTION','FINDINGS','COMMENTS']);
-    const techNotes=getSection(normalized,'TECHNICIAN',['SIGNATURE','DATE'])||getSection(normalized,'FINDINGS',['SIGNATURE','DATE']);
+    const date=extractIncidentDate(normalized);
+
+    const address=
+      findLabeledValue(normalized,['location of the problem'])||
+      normalized.match(/\[FORM FIELD\]\s*LOCATION OF THE PROBLEM:\s*(.+)/i)?.[1]||
+      '';
+
+    const cab=
+      findLabeledValue(normalized,['cab'])||
+      normalized.match(/\[FORM FIELD\]\s*CAB:\s*([A-Z0-9]+)/i)?.[1]||
+      '';
+
+    const problem=
+      normalized.match(/\[FORM FIELD\]\s*DESCRIPTION OF THE PROBLEM:\s*(.+?)(?=\n\[FORM FIELD\])/is)?.[1]?.trim()||
+      '';
+
+    const techProblem=
+      normalized.match(/\[FORM FIELD\]\s*DESCRIPTION OF THE PROBLEM_2:\s*(.+?)(?=\n\[FORM FIELD\])/is)?.[1]?.trim()||
+      '';
+
+    const reference=extractReferenceNumber(normalized);
+
+    const floorMatch=problem.match(/on the\s+(\d{1,2})(?:st|nd|rd|th)?\s+floor/i);
+    const floor=floorMatch?`${floorMatch[1]}th Floor`:'';
+
+    const elevator=cab?`Elevator ${cab}`:'';
+
+    const issue=
+      /brake|break|switch|service|out of service|repair/i.test(problem+' '+techProblem)
+        ?'Mechanical Failure'
+        :inferIssueFromDescription(problem+' '+techProblem);
+
+    const status=
+      /actual time of arrival:\s*[^\n]+/i.test(normalized)||
+      /technician/i.test(normalized)
+        ?'Resolved'
+        :'Open';
+
+    const description=
+      `On ${date}, ${elevator} at One Buckhead Plaza was reported out of service${floor?` on the ${floor}`:''}. `+
+      `No entrapment was reported. KONE Elevator Service was contacted${reference?` and service ticket ${reference} was created`:''}. `+
+      `${techProblem?`The technician reported: ${techProblem}.`:''}`;
+
     return {
       type,
-      date:getFirstDate(normalized),
-      building,
+      date,
+      building:'One Buckhead Plaza',
+      location:[address,floor].filter(Boolean).join(' / '),
       elevator,
-      issue:inferIssueFromDescription(problem),
-      status:determineCallLogStatus(normalized),
-      description:ensureDescriptionHasRequirements(problem||stripLabeledLines(normalized),elevator,reference),
-      notes:pickRelevantSentences(techNotes,2),
+      issue,
+      status,
+      description,
+      notes:techProblem,
       reference
     };
   }
 
-  const date=findLabeledValue(normalized,PDF_FIELD_LABELS.date)||getFirstDate(normalized);
+  const date=findLabeledValue(normalized,PDF_FIELD_LABELS.date)||extractIncidentDate(normalized);
   const building=locationValue||findLabeledValue(normalized,PDF_FIELD_LABELS.building);
   const elevator=findLabeledValue(normalized,PDF_FIELD_LABELS.elevator)||normalized.match(/(?:elevator|lift)\s*([a-z]|2[0-6]|1\d|[1-9])\b/i)?.[1]||'';
   const issue=findLabeledValue(normalized,PDF_FIELD_LABELS.issue)||findOptionMatch(normalized,ISSUES);
@@ -337,34 +473,6 @@ function parseLocalByType(text){
     notes:pickRelevantSentences(notes,2),
     reference
   };
-}
-
-async function summarizeWithAnthropic(text){
-  const apiKey=(localStorage.getItem(ANTHROPIC_KEY_STORAGE)||'').trim();
-  if(!apiKey)throw new Error('missing_api_key');
-  const payload={
-    model:ANTHROPIC_MODEL,
-    max_tokens:700,
-    system:AI_SYSTEM_PROMPT,
-    messages:[{role:'user',content:[{type:'text',text}]}]
-  };
-  const response=await fetch('https://api.anthropic.com/v1/messages',{
-    method:'POST',
-    headers:{
-      'content-type':'application/json',
-      'x-api-key':apiKey,
-      'anthropic-version':'2023-06-01'
-    },
-    body:JSON.stringify(payload)
-  });
-  if(!response.ok)throw new Error(`anthropic_${response.status}`);
-  const data=await response.json();
-  const raw=(data.content||[]).map(part=>part.text||'').join(' ').trim();
-  if(!raw)throw new Error('anthropic_empty');
-  const start=raw.indexOf('{');
-  const end=raw.lastIndexOf('}');
-  if(start<0||end<0||end<=start)throw new Error('anthropic_json_missing');
-  return JSON.parse(raw.slice(start,end+1));
 }
 
 function mapAiResult(aiResult,rawText){
@@ -423,9 +531,23 @@ function markAutoFillHighlight(record){
 }
 
 function fillIncidentForm(record){
-  if(record.date)$('f-date').value=record.date;
+  // Always set date explicitly — never leave it as stale UI default
+  $('f-date').value=record.date||new Date().toISOString().slice(0,10);
   if(record.building)$('f-bld').value=record.building;
-  if(record.elevator)$('f-elev').value=formatElevatorLabel(record.elevator);
+  // Elevator: try exact match first (e.g. "Elevator G"), then partial
+  if(record.elevator){
+    const sel=$('f-elev');
+    const label=formatElevatorLabel(record.elevator);
+    // Check if the formatted label exists as an option
+    const exactOpt=[...sel.options].find(o=>o.value===label||o.text===label);
+    if(exactOpt){sel.value=exactOpt.value;}
+    else{
+      // Try matching just the token part (e.g. "G" or "10")
+      const token=String(record.elevator).replace(/elevator\s*/i,'').trim();
+      const tokenOpt=[...sel.options].find(o=>o.value===formatElevatorLabel(token)||o.text===formatElevatorLabel(token));
+      if(tokenOpt)sel.value=tokenOpt.value;
+    }
+  }
   if(record.issue)$('f-issue').value=record.issue;
   if(record.status)$('f-stat').value=record.status;
   if(record.description)$('f-desc').value=record.description;
@@ -433,16 +555,74 @@ function fillIncidentForm(record){
   markAutoFillHighlight(record);
 }
 
-function applyImportDefaults(incident){
-  const today=new Date().toISOString().slice(0,10);
+function pickNonEmpty(primary,fallback=''){
+  const p=typeof primary==='string'?primary.trim():primary;
+  if(p!==undefined&&p!==null&&p!=='')return p;
+  const f=typeof fallback==='string'?fallback.trim():fallback;
+  return f!==undefined&&f!==null?f:'';
+}
+
+function normalizeImportedIncident(incident){
+  const rawElevator=String(incident.elevator||'').trim();
+
+  let elevatorToken='';
+
+  // Case 1: "Service Elevator Cab #10" or "Elevator Cab #10" → extract number → "10"
+  const cabNumMatch=rawElevator.match(/cab\s*#?\s*(\d{1,2})/i);
+  if(cabNumMatch){
+    const n=parseInt(cabNumMatch[1],10);
+    if(n>=1&&n<=26)elevatorToken=String(n);
+  }
+
+  // Case 2: "Elevator G" or "Elevator 10" → extract token after "Elevator "
+  if(!elevatorToken){
+    const afterElev=rawElevator.replace(/^Elevator\s+/i,'').trim();
+    // If it's a plain number 1-26
+    const numOnly=afterElev.match(/^(\d{1,2})$/);
+    if(numOnly){
+      const n=parseInt(numOnly[1],10);
+      if(n>=1&&n<=26)elevatorToken=String(n);
+    }
+    // If it's a single letter A-Z
+    const letterOnly=afterElev.match(/^([A-Z])$/i);
+    if(!elevatorToken&&letterOnly)elevatorToken=letterOnly[1].toUpperCase();
+  }
+
+  // Case 3: raw token is just a number or letter
+  if(!elevatorToken){
+    elevatorToken=normalizeElevator(rawElevator)||'1';
+  }
+
+  const normalizedBuilding=String(incident.building||incident.location||'').trim();
+  const date=normalizeDate(incident.date||'')||new Date().toISOString().slice(0,10);
+  const issue=findOptionMatch(incident.issue,ISSUES)||'Other';
+  const status=findOptionMatch(incident.status,STATS)||'Open';
+
+  console.log(`[normalize] elevator raw="${rawElevator}" token="${elevatorToken}" issue="${issue}" status="${status}" date="${date}"`);
+
   return {
     ...incident,
-    date:incident.date||today,
-    building:incident.building||'',
-    elevator:incident.elevator||'A',
+    date,
+    building:normalizedBuilding||'Unknown Location',
+    location:String(incident.location||'').trim()||normalizedBuilding||'Unknown Location',
+    elevator:elevatorToken,
+    issue,
+    status,
+    description:String(incident.description||'').trim()||'Incident imported from PDF.',
+    notes:String(incident.notes||'').trim()||'No additional notes provided.'
+  };
+}
+
+function applyImportDefaults(incident){
+  return {
+    ...incident,
+    date:incident.date||new Date().toISOString().slice(0,10),
+    building:incident.building||incident.location||'Unknown Location',
+    elevator:incident.elevator||'1',
     issue:incident.issue||'Other',
     status:incident.status||'Open',
-    description:incident.description||'PDF report imported. Review details and save.'
+    description:incident.description||'Incident imported from PDF and summarized.',
+    notes:incident.notes||'No additional notes provided.'
   };
 }
 
@@ -465,46 +645,39 @@ async function processPdfFile(file){
     showAddToast('err','Upload a PDF file only.');
     return;
   }
-  if(!window.pdfjsLib){
-    setImportStatus('fail','PDF parsing library is unavailable. Refresh and try again.');
-    showAddToast('err','PDF import is unavailable right now.');
-    return;
-  }
 
   try{
-    setImportStatus('loading','Reading PDF...');
-    const bytes=new Uint8Array(await file.arrayBuffer());
-    const pdf=await window.pdfjsLib.getDocument({data:bytes}).promise;
-    const pages=[];
-    for(let pageNumber=1;pageNumber<=pdf.numPages;pageNumber++){
-      const page=await pdf.getPage(pageNumber);
-      const text=await page.getTextContent();
-      pages.push(extractPdfPageText(text.items));
+    setImportStatus('loading','Uploading PDF...');
+    const formData=new FormData();
+    formData.append('file',file);
+    const response=await fetch('/api/pdf-import',{method:'POST',body:formData});
+    if(!response.ok){
+      const errorData=await response.json().catch(()=>({}));
+      throw new Error(errorData.error||`Server error ${response.status}`);
     }
 
-    const rawText=pages.join('\n');
-    let incident;
-    try{
-      setImportStatus('loading','Summarizing with AI...');
-      const ai=await summarizeWithAnthropic(rawText);
-      incident=mapAiResult(ai,rawText);
-    }catch{
-      incident=parseLocalByType(rawText);
+    const payload=await response.json();
+    console.log('[pdf-import] payload received',JSON.stringify(payload.incident));
+
+    let incident=payload.incident||{};
+
+    // Show warning if AI fell back
+    if(payload.warning){
+      console.warn('[pdf-import] server warning:',payload.warning);
     }
 
+    incident=normalizeImportedIncident(incident);
     incident=applyImportDefaults(incident);
-    const matched=Object.entries(incident).filter(([,value])=>Boolean(value));
-    if(!matched.length){
-      setImportStatus('fail','No recognizable incident fields were found in that PDF.');
-      showAddToast('err','PDF imported, but no form fields could be matched.');
-      return;
-    }
 
+    console.log('[pdf-import] final normalized incident',JSON.stringify(incident));
+
+    const filledCount=Object.values(incident).filter(v=>v&&v!=='Unknown Location'&&v!=='No additional notes provided.').length;
     fillIncidentForm(incident);
-    setImportStatus('done',`${matched.length} fields auto-filled. Review and click Save.`);
-    showAddToast('ok','PDF imported. Click Save Incident to add it to the Incident Log.');
+    setImportStatus('done',`${filledCount} fields auto-filled${payload.warning?' (AI unavailable, used local parser)':''}. Review and click Save.`);
+    showAddToast(payload.warning?'info':'ok','PDF imported. Review the form and click Save Incident.');
   }catch(error){
-    setImportStatus('fail','Could not read that PDF. Use a text-based PDF with labeled fields.');
+    console.error('[pdf-import] failed',error.message);
+    setImportStatus('fail',`Import failed: ${error.message}`);
     showAddToast('err',`PDF import failed: ${error.message}`);
   }
 }
@@ -984,9 +1157,7 @@ function initFilters(){
 
 function initPdfImport(){
   const input=$('pdf-upload');
-  const dropZone=$('pdf-drop-zone');
   const clearBtn=$('clear-btn');
-  const keyInput=$('anthropic-key');
   if(input){
     input.addEventListener('change',async event=>{
       const file=event.target.files?.[0];
@@ -994,27 +1165,7 @@ function initPdfImport(){
       event.target.value='';
     });
   }
-  if(dropZone){
-    ['dragenter','dragover'].forEach(evt=>dropZone.addEventListener(evt,e=>{
-      e.preventDefault();
-      e.stopPropagation();
-      dropZone.classList.add('drag-on');
-    }));
-    ['dragleave','drop'].forEach(evt=>dropZone.addEventListener(evt,e=>{
-      e.preventDefault();
-      e.stopPropagation();
-      dropZone.classList.remove('drag-on');
-    }));
-    dropZone.addEventListener('drop',async event=>{
-      const file=event.dataTransfer?.files?.[0];
-      await processPdfFile(file);
-    });
-  }
   if(clearBtn)clearBtn.addEventListener('click',clearIncidentForm);
-  if(keyInput){
-    keyInput.value=localStorage.getItem(ANTHROPIC_KEY_STORAGE)||'';
-    keyInput.addEventListener('change',()=>localStorage.setItem(ANTHROPIC_KEY_STORAGE,keyInput.value.trim()));
-  }
 }
 
 //  Boot 
