@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LiftLog - Elevator Incident Tracker</title>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.10.0/dist/tabler-icons.min.css">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
@@ -74,6 +75,26 @@
         <div class="ps">Record a new elevator incident</div>
       </div>
       <div class="toast" id="add-toast"></div>
+      <div class="import-card">
+        <div class="import-copy">
+          <div class="import-title">PDF Auto-Fill</div>
+          <div class="import-text">Drop a Marksman security PDF here. LiftLog reads the file, summarizes it, and auto-fills the incident fields.</div>
+        </div>
+        <div class="file-drop-zone" id="pdf-drop-zone">
+          <i class="ti ti-file-type-pdf"></i>
+          <div class="file-drop-copy">
+            <strong>Drop PDF Here</strong>
+            <span>or click to browse</span>
+          </div>
+          <label class="file-drop" for="pdf-upload">Choose PDF</label>
+          <input type="file" id="pdf-upload" accept="application/pdf">
+        </div>
+        <div class="fgr api-key-row">
+          <label>Anthropic API Key (optional)</label>
+          <input type="password" id="anthropic-key" placeholder="sk-ant-...">
+        </div>
+        <div class="import-status" id="pdf-status">Ready for a single incident report PDF.</div>
+      </div>
       <div class="fg">
         <div class="fgr"><label>Date *</label><input type="date" id="f-date"></div>
         <div class="fgr"><label>Building *</label><input type="text" id="f-bld" placeholder="e.g. Main Building"></div>
@@ -85,7 +106,10 @@
         <div class="fgr fw"><label>Description</label><textarea id="f-desc" placeholder="Describe what happened..."></textarea></div>
         <div class="fgr fw"><label>Resolution Notes</label><textarea id="f-notes" placeholder="Steps taken or planned..." style="min-height:60px"></textarea></div>
       </div>
-      <button class="btn-p" onclick="saveInc()"><i class="ti ti-device-floppy"></i>Save Incident</button>
+      <div class="btns-row">
+        <button class="btn-p" onclick="saveInc()"><i class="ti ti-device-floppy"></i>Save Incident</button>
+        <button class="btn-s" id="clear-btn" type="button"><i class="ti ti-eraser"></i>Clear Form</button>
+      </div>
     </div>
 
     <!-- INCIDENT LOG -->
