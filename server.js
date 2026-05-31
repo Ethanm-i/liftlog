@@ -15,7 +15,11 @@ const upload = multer({
 
 const ISSUES = ['Entrapment', 'Door Issue', 'Mechanical Failure', 'Power Outage', 'Inspection Issue', 'Noise/Vibration', 'Other'];
 const STATS = ['Open', 'In Progress', 'Resolved'];
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+const DEFAULT_OPENAI_MODEL = 'gpt-4o';
+
+function getEnv(name) {
+  return globalThis.Netlify?.env?.get?.(name) || process.env[name] || '';
+}
 
 const AI_SYSTEM_PROMPT = `You are an expert elevator incident data extractor.
 Return ONLY valid JSON with these exact keys. No extra text.
@@ -318,8 +322,9 @@ function detectType(text) {
 }
 
 async function callOpenAI(text) {
-  const apiKey = (process.env.OPENAI_API_KEY || '').trim();
+  const apiKey = getEnv('OPENAI_API_KEY').trim();
   if (!apiKey) throw new Error('missing_key');
+  const model = getEnv('OPENAI_MODEL').trim() || DEFAULT_OPENAI_MODEL;
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -328,7 +333,7 @@ async function callOpenAI(text) {
       'authorization': `Bearer ${apiKey}`
     },
     body: JSON.stringify({
-      model: OPENAI_MODEL,
+      model,
       temperature: 0,
       max_tokens: 900,
       response_format: { type: 'json_object' },
@@ -495,38 +500,45 @@ function mergeWithLocal(aiResult, text) {
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────────
+async function importPdfBuffer(buffer) {
+  const parsed = await pdfParse(buffer);
+  const pageText = normText(parsed.text || '');
+  const formText = await extractPdfFormFieldText(buffer);
+  const rawText = normText([pageText, formText].filter(Boolean).join('\n'));
+
+  if (!rawText) {
+    const error = new Error('No text extracted.');
+    error.statusCode = 422;
+    throw error;
+  }
+
+  console.log(`[pdf-import] ${rawText.length} chars | ${formText ? 'form fields found' : 'no form fields'} | Type: ${detectType(rawText)}`);
+
+  let incident, warning = '';
+
+  try {
+    const ai = await callOpenAI(rawText);
+    console.log('[pdf-import] AI succeeded');
+    incident = mergeWithLocal(ai, rawText);
+  } catch (err) {
+    console.error('[pdf-import] AI failed:', err.message);
+    incident = parseLocal(rawText);
+    warning = `AI unavailable (${err.message}); used local fallback.`;
+  }
+
+  return { incident, warning, rawText: rawText.slice(0, 800) };
+}
+
 app.use(express.static(__dirname));
 
 app.post('/api/pdf-import', upload.single('file'), async (req, res) => {
   try {
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'No PDF uploaded.' });
-
-    const parsed = await pdfParse(file.buffer);
-    const pageText = normText(parsed.text || '');
-    const formText = await extractPdfFormFieldText(file.buffer);
-    const rawText = normText([pageText, formText].filter(Boolean).join('\n'));
-
-    if (!rawText) return res.status(422).json({ error: 'No text extracted.' });
-
-    console.log(`[pdf-import] ${rawText.length} chars | ${formText ? 'form fields found' : 'no form fields'} | Type: ${detectType(rawText)}`);
-
-    let incident, warning = '';
-
-    try {
-      const ai = await callOpenAI(rawText);
-      console.log('[pdf-import] AI succeeded');
-      incident = mergeWithLocal(ai, rawText);
-    } catch (err) {
-      console.error('[pdf-import] AI failed:', err.message);
-      incident = parseLocal(rawText);
-      warning = `AI unavailable (${err.message}); used local fallback.`;
-    }
-
-    res.json({ incident, warning, rawText: rawText.slice(0, 800) });
+    res.json(await importPdfBuffer(file.buffer));
   } catch (err) {
     console.error('[pdf-import] fatal error:', err);
-    res.status(500).json({ error: err.message });
+    res.status(err.statusCode || 500).json({ error: err.message });
   }
 });
 
@@ -540,6 +552,7 @@ module.exports = {
   parseLocal,
   mergeWithLocal,
   extractPdfFormFieldText,
+  importPdfBuffer,
   detectType,
   app
 };
