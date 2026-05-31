@@ -1,350 +1,545 @@
-const path=require('path');
+const path = require('path');
 require('dotenv').config();
-const express=require('express');
-const multer=require('multer');
-const pdfParse=require('pdf-parse');
+const express = require('express');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const pdfjs = require('pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js');
 
-const app=express();
-const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:10*1024*1024}});
+pdfjs.disableWorker = true;
 
-const ISSUES=['Entrapment','Door Issue','Mechanical Failure','Power Outage','Inspection Issue','Noise/Vibration','Other'];
-const STATS=['Open','In Progress','Resolved'];
-const OPENAI_MODEL=process.env.OPENAI_MODEL||'gpt-4o-mini';
+const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
 
-const AI_SYSTEM_PROMPT=`You are an assistant that extracts elevator incident data from security report PDFs.
-Return ONLY a valid JSON object with these exact keys — no markdown, no explanation:
+const ISSUES = ['Entrapment', 'Door Issue', 'Mechanical Failure', 'Power Outage', 'Inspection Issue', 'Noise/Vibration', 'Other'];
+const STATS = ['Open', 'In Progress', 'Resolved'];
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+
+const AI_SYSTEM_PROMPT = `You are an expert elevator incident data extractor.
+Return ONLY valid JSON with these exact keys. No extra text.
 
 {
-  "date": "YYYY-MM-DD — use the FIRST date found in the document, no exceptions",
-  "building": "For Incident Reports use the Client field value. For Elevator Call Logs use the LOCATION OF THE PROBLEM field value.",
-  "elevator": "Format: 'Elevator X'. Source is the CAB # field. If CAB # is a letter A-Z, use it directly. If CAB # is a number 1-26, map it: 1=A,2=B,3=C,4=D,5=E,6=F,7=G,8=H,9=I,10=J,11=K,12=L,13=M,14=N,15=O,16=P,17=Q,18=R,19=S,20=T,21=U,22=V,23=W,24=X,25=Y,26=Z",
-  "issue_type": "One of: Entrapment, Door Issue, Mechanical Failure, Power Outage, Inspection Issue, Noise/Vibration, Other. RULE: if document title contains 'Incident Report' the value is ALWAYS Entrapment. If document is an Elevator Call Log, determine from description.",
-  "status": "Open, In Progress, or Resolved. Incident Report: Open if elevator still out of service or repair pending overnight; Resolved if occupant released and elevator cleared same day. Call Log: Resolved if technician name and actual arrival time are both present; otherwise Open.",
-  "description": "2-3 sentences in plain English. MUST include: (1) elevator identifier e.g. Elevator G or Service Elevator Cab #10, (2) any reference/service ticket number found in the document e.g. KONE service ticket #17542681, (3) concise factual summary of what happened.",
-  "resolution_notes": "1-2 sentences summarizing actions taken or technician findings. Include technician name if present."
+  "date": "YYYY-MM-DD — use the FIRST real incident date",
+  "building": "Use 'Client' for Incident Reports, 'LOCATION OF THE PROBLEM' for Call Logs",
+  "elevator": "Format: 'Elevator X'. Convert CAB # number to letter if needed (1=A, 7=G, etc.)",
+  "issue_type": "One of: Entrapment, Door Issue, Mechanical Failure, Power Outage, Inspection Issue, Noise/Vibration, Other. ALWAYS 'Entrapment' for Incident Reports",
+  "status": "Open / In Progress / Resolved based on document clues",
+  "description": "2-3 sentences including elevator ID and any ticket number",
+  "resolution_notes": "Actions taken and technician name if mentioned"
 }`;
 
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-
-// ── Text helpers ──────────────────────────────────────────────────────────────
-
-function normText(text){
-  return String(text||'')
-    .replace(/\r/g,'')
+// ── Text Helpers ──────────────────────────────────────────────────────────────
+function normText(text) {
+  return String(text || '')
+    .replace(/\r/g, '')
     .split('\n')
-    .map(l=>l.replace(/\s+/g,' ').trim())
+    .map(l => l.replace(/\s+/g, ' ').trim())
     .filter(Boolean)
     .join('\n');
 }
 
-function normalizeDate(raw){
-  if(!raw)return '';
-  const s=String(raw).replace(/\./g,'/').trim();
-  if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s;
-  // MM/DD/YYYY or MM/DD/YY
-  const slash=s.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-  if(slash){
-    const mo=slash[1].padStart(2,'0'),d=slash[2].padStart(2,'0');
-    const yr=slash[3].length===2?`20${slash[3]}`:slash[3];
+function normalizeDate(raw) {
+  if (!raw) return '';
+  const s = String(raw).replace(/\./g, '/').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const slash = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (slash) {
+    const mo = slash[1].padStart(2, '0');
+    const d = slash[2].padStart(2, '0');
+    const yr = slash[3].length === 2 ? `20${slash[3]}` : slash[3];
     return `${yr}-${mo}-${d}`;
   }
-  const p=new Date(s);
-  return isNaN(p.getTime())?'':p.toISOString().slice(0,10);
+  const p = new Date(s);
+  return isNaN(p.getTime()) ? '' : p.toISOString().slice(0, 10);
 }
 
-function getFirstDate(text){
-  // Strip revision stamps like "WN07052022" or "(Rev 02/22/2022)" before scanning
-  const cleaned=text
-    .replace(/\bWN\d{6,8}\b/gi,'')
-    .replace(/\(Rev\s+\d{1,2}\/\d{1,2}\/\d{2,4}\)/gi,'');
-  const mo='jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
-  const rx=new RegExp(`\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b|\\b(?:${mo})\\s+\\d{1,2},?\\s+\\d{4}\\b`,'ig');
-  for(const m of cleaned.matchAll(rx)){
-    const d=normalizeDate(m[0]);
-    if(d)return d;
+function getFirstDate(text) {
+  const cleaned = text.replace(/\bWN\d{6,8}\b/gi, '').replace(/\(Rev\s+\d{1,2}\/\d{1,2}\/\d{2,4}\)/gi, '');
+  const mo = 'jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?';
+  const rx = new RegExp(`\\b\\d{4}-\\d{2}-\\d{2}\\b|\\b\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\b|\\b(?:${mo})\\s+\\d{1,2},?\\s+\\d{4}\\b`, 'ig');
+  for (const m of cleaned.matchAll(rx)) {
+    const d = normalizeDate(m[0]);
+    if (d) return d;
   }
   return '';
 }
 
-function findOptionMatch(raw,options){
-  if(!raw)return '';
-  const l=String(raw).toLowerCase();
-  return options.find(o=>l.includes(o.toLowerCase()))||'';
+function escapeRx(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function extractCab(text){
-  // Priority order: explicit form fields first, then inline patterns
-  const patterns=[
-    /\bCAB\s*#\s*[:\-]?\s*([A-Z])\b/i,          // CAB #: G  (letter)
-    /\bCAB\s*#?\s*[:\-]\s*([A-Z])\b/i,
-    /\bCAB\s*#\s*[:\-]?\s*(\d{1,2})\b/i,          // CAB #: 10 (number)
-    /\bCAB\s*#?\s*[:\-]\s*(\d{1,2})\b/i,
-    /Service\s+Elevator\s+Cab\s*#\s*(\d{1,2})/i,  // Service Elevator Cab #10
-    /Elevator\s+Cab\s*#\s*(\d{1,2})/i,
+function findLabeledValue(text, labels) {
+  for (const label of labels) {
+    const rx = new RegExp(`(?:^|\\n)${escapeRx(label)}\\s*[:\\-]\\s*(.+)`, 'i');
+    const match = text.match(rx);
+    const value = cleanExtractedValue(match && match[1]);
+    if (value) return value;
+  }
+  return '';
+}
+
+function cleanExtractedValue(value) {
+  const cleaned = String(value || '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  if (!cleaned) return '';
+  if (!cleaned.replace(/[_\s:./\\\-()?]+/g, '')) return '';
+  return cleaned;
+}
+
+function findFormFieldValue(text, fieldNamePattern) {
+  const rx = new RegExp(
+    `(?:^|\\n)\\[FORM FIELD\\]\\s*${fieldNamePattern}\\s*:\\s*([\\s\\S]*?)(?=\\n\\[FORM FIELD\\]|$)`,
+    'i'
+  );
+  const match = text.match(rx);
+  return cleanExtractedValue(match && match[1]);
+}
+
+function getSection(text, startLabel, endLabels = []) {
+  const source = `\n${text}`;
+  const startRx = new RegExp(`\\n${escapeRx(startLabel)}\\s*:?\\s*`, 'i');
+  const startMatch = source.match(startRx);
+  if (!startMatch) return '';
+
+  const startIndex = (startMatch.index || 0) + startMatch[0].length;
+  const rest = source.slice(startIndex);
+  let endIndex = rest.length;
+
+  for (const label of endLabels) {
+    const endRx = new RegExp(`\\n${escapeRx(label)}\\s*:?`, 'i');
+    const endMatch = rest.match(endRx);
+    if (endMatch && typeof endMatch.index === 'number') {
+      endIndex = Math.min(endIndex, endMatch.index);
+    }
+  }
+
+  return rest.slice(0, endIndex).trim();
+}
+
+function pickRelevantSentences(text, maxSentences = 2) {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+
+  const keys = /(elevator|lift|cab|stuck|trapped|entrap|door|fault|alarm|out of service|technician|rescue|release|repair|service|ticket|reference|returned to service|brake|switch)/i;
+  const sentences = cleaned.split(/(?<=[.!?])\s+/).map(s => s.trim()).filter(Boolean);
+  const relevant = sentences.filter(sentence => keys.test(sentence));
+  return (relevant.length ? relevant : sentences).slice(0, maxSentences).join(' ').trim();
+}
+
+function extractIncidentDate(text) {
+  const cleaned = text.replace(/(?:rev|wn)\s*\d{6,8}|\(Rev\s*\d{1,2}\/\d{1,2}\/\d{2,4}\)/ig, '');
+  const patterns = [
+    /\bDate\s*[:\-]\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+    /\bOn\s+(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i,
+    /\bOn\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})/i
   ];
-  for(const rx of patterns){
-    const m=text.match(rx);
-    if(m)return m[1].trim().toUpperCase();
+
+  for (const rx of patterns) {
+    const match = cleaned.match(rx);
+    if (match) return normalizeDate(match[1]);
   }
-  // Last resort: "Elevator G" anywhere
-  const inline=text.match(/\bElevator\s+([A-Z])\b/i);
-  return inline?inline[1].toUpperCase():'';
+
+  return getFirstDate(cleaned);
 }
 
-function cabToElevator(raw){
-  if(!raw)return '';
-  const up=String(raw).toUpperCase().trim();
-  // Single letter A-Z → keep as letter
-  if(/^[A-Z]$/.test(up))return `Elevator ${up}`;
-  // Number 1-26 → keep as number (dropdown includes 1-26)
-  const n=parseInt(up,10);
-  if(!isNaN(n)&&n>=1&&n<=26)return `Elevator ${n}`;
+function extractIncidentLocation(text) {
+  const explicit = extractLocation(text);
+  if (explicit) return explicit;
+
+  const floor = text.match(/(?:stuck near|stuck on|on the|to the)\s+(\d{1,2})(?:st|nd|rd|th)?\s+floor/i);
+  if (floor) return `${floor[1]}th Floor`;
   return '';
 }
 
-function extractLocation(text){
-  const m=text.match(/(?:^|\n)LOCATION\s+OF\s+THE\s+PROBLEM\s*[:\-]\s*(.+)/im);
-  return m?m[1].trim():'';
-}
+function extractPersonInvolved(text) {
+  const formPerson = findFormFieldValue(text, 'Persons\\s+Involved[^:]*Row1');
+  if (formPerson) return formPerson.trim();
 
-function extractClient(text){
-  const m=text.match(/\bClient\s*[:\-]\s*(.+)/i);
-  return m?m[1].trim():'';
-}
+  const withInside = text.match(/with\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s+inside/i);
+  if (withInside) return withInside[1].trim();
 
-function extractReference(text){
-  const patterns=[
-    /service\s+(?:ticket\s+)?reference\s*(?:number\s*)?#?\s*([A-Z0-9]{5,})/i,
-    /reference\s+number\s*#?\s*([A-Z0-9]{5,})/i,
-    /ticket\s*#\s*([A-Z0-9]{5,})/i,
-    /#\s*([0-9]{5,})/,
-  ];
-  for(const rx of patterns){
-    const m=text.match(rx);
-    if(m)return `#${m[1].replace(/^#/,'')}`;
-  }
+  const identified = text.match(/identified as\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/i);
+  if (identified) return identified[1].trim();
   return '';
 }
 
-function inferIssue(text){
-  const l=text.toLowerCase();
-  if(/mechanical|motor|gear|brake|break\s+switch|controller|out\s+of\s+service|adjust/i.test(l))return 'Mechanical Failure';
-  if(/no\s+entrap|no\s+one\s+trapped|no\s+passenger\s+trapped/.test(l))return 'Mechanical Failure';
-  if(/entrap|trapp?ed|stuck\s+inside|code\s+gold/i.test(l))return 'Entrapment';
-  if(/door|closing|opening|sensor/i.test(l))return 'Door Issue';
-  if(/power|outage|blackout|electric/i.test(l))return 'Power Outage';
-  if(/inspection|violation|code/i.test(l))return 'Inspection Issue';
-  if(/noise|vibration|rattle|shaking/i.test(l))return 'Noise/Vibration';
+function inferIssueFromText(text) {
+  const lower = String(text || '').toLowerCase();
+  const noEntrapment = /no\s+entrapment|without\s+entrapment/.test(lower);
+
+  if (!noEntrapment && /entrap|trapped|stuck inside/.test(lower)) return 'Entrapment';
+  if (/power|outage|blackout/.test(lower)) return 'Power Outage';
+  if (/inspection|violation|code/.test(lower)) return 'Inspection Issue';
+  if (/noise|vibration|rattle/.test(lower)) return 'Noise/Vibration';
+  if (/door|closing|opening|reopen/.test(lower)) return 'Door Issue';
+  if (/out of service|brake|motor|shutdown|fault|mechanical|reset|switch|repair/.test(lower)) return 'Mechanical Failure';
   return 'Other';
 }
 
-function inferStatus(text,type){
-  if(type==='incident_report'){
-    if(/out\s+of\s+service\s+for\s+the\s+night|will\s+come\s+out\s+to\s+repair|repair\s+pending/i.test(text))return 'Open';
-    if(/released|cleared\s+the\s+code\s+gold|returned\s+to\s+service/i.test(text))return 'Resolved';
-    return 'Open';
+function buildIncidentDescription(fields) {
+  const parts = [];
+
+  if (fields.date && fields.person && fields.elevator && fields.building) {
+    parts.push(`On ${fields.date}, ${fields.person} became trapped inside ${fields.elevator} at ${fields.building}.`);
+  } else if (fields.elevator && fields.building) {
+    parts.push(`${fields.elevator} was involved in an incident at ${fields.building}.`);
+  } else if (fields.elevator) {
+    parts.push(`Incident involving ${fields.elevator}.`);
   }
-  // Call log: resolved when tech name + actual arrival both present
-  const hasTech=/FULL\s+NAME\s+OF\s+THE\s+ELEVATOR\s+TECHNICIAN\s*[:\-]\s*[A-Za-z]{2,}/i.test(text);
-  const hasArrival=/ACTUAL\s+TIME\s+OF\s+ARRIVAL\s*[:\-]\s*[^\n]{2,}/i.test(text);
-  return hasTech&&hasArrival?'Resolved':'Open';
+
+  if (fields.location) {
+    parts.push(`The elevator was reported near ${fields.location}, and security responded.`);
+  }
+
+  if (fields.reference) {
+    parts.push(`Reference: ${fields.reference}.`);
+  }
+
+  return parts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-function detectType(text){
-  if(/ELEVATOR\s+CALL\s+LOG/i.test(text))return 'call_log';
-  if(/Incident\s+Report/i.test(text))return 'incident_report';
+// ... (keeping all your original helper functions: extractCab, cabToElevator, etc.)
+// I'll include them all below for completeness
+
+function findOptionMatch(raw, options) {
+  if (!raw) return '';
+  const l = String(raw).toLowerCase();
+  return options.find(o => l.includes(o.toLowerCase())) || '';
+}
+
+function extractCab(text) {
+  const formCab = findFormFieldValue(text, 'CAB\\s*#?');
+  if (formCab) return formCab.trim().toUpperCase();
+
+  const patterns = [
+    /\bCAB\s*#\s*[:\-]?\s*([A-Z])\b/i,
+    /\bCAB\s*#?\s*[:\-]\s*([A-Z])\b/i,
+    /\bCAB\s*#\s*[:\-]?\s*(\d{1,2})\b/i,
+    /Service\s+Elevator\s+Cab\s*#\s*(\d{1,2})/i,
+    /Elevator\s+Cab\s*#\s*(\d{1,2})/i,
+  ];
+  for (const rx of patterns) {
+    const m = text.match(rx);
+    if (m) return m[1].trim().toUpperCase();
+  }
+  return '';
+}
+
+function cabToElevator(raw) {
+  if (!raw) return '';
+  const up = String(raw).toUpperCase().trim();
+  if (/^[A-Z]$/.test(up)) return `Elevator ${up}`;
+  const n = parseInt(up, 10);
+  if (!isNaN(n) && n >= 1 && n <= 26) return `Elevator ${n}`;
+  return '';
+}
+
+function extractLocation(text) {
+  const formLocation = findFormFieldValue(text, 'LOCATION\\s+OF\\s+THE\\s+PROBLEM');
+  if (formLocation) return formLocation;
+
+  const m = text.match(/(?:^|\n)LOCATION\s+OF\s+THE\s+PROBLEM\s*[:\-]\s*(.+)/im);
+  if (!m) return '';
+
+  const beforeCab = m[1].split(/\bCAB\s*#?\b/i)[0];
+  return cleanExtractedValue(beforeCab);
+}
+
+function extractClient(text) {
+  const formClient = findFormFieldValue(text, 'Client');
+  if (formClient) return formClient;
+
+  const m = text.match(/\bClient\s*[:\-]\s*(.+)/i);
+  return cleanExtractedValue(m && m[1]);
+}
+
+function extractBuilding(text) {
+  if (/one\s+buckhead\s+plaza/i.test(text) || /\bOBP\b/i.test(text)) return 'One Buckhead Plaza';
+  return extractLocation(text) || extractClient(text) || '';
+}
+
+function extractReference(text) {
+  const patterns = [
+    /service\s+(?:ticket\s+)?reference\s*(?:number\s*)?#?\s*([A-Z0-9]{5,})/i,
+    /ticket\s*#\s*([A-Z0-9]{5,})/i,
+    /#\s*([0-9]{5,})/,
+  ];
+  for (const rx of patterns) {
+    const m = text.match(rx);
+    if (m) return `#${m[1].replace(/^#/, '')}`;
+  }
+  return '';
+}
+
+function stringifyAnnotationValue(value) {
+  if (Array.isArray(value)) return value.map(stringifyAnnotationValue).filter(Boolean).join(', ');
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/\r/g, '\n').replace(/\s+\n/g, '\n').trim();
+}
+
+async function extractPdfFormFieldText(buffer) {
+  let doc;
+  const lines = [];
+
+  try {
+    doc = await pdfjs.getDocument(buffer);
+
+    for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
+      const page = await doc.getPage(pageNumber);
+      const annotations = await page.getAnnotations();
+
+      for (const annotation of annotations) {
+        const name = String(annotation.fieldName || annotation.alternativeText || '').trim();
+        const value = stringifyAnnotationValue(annotation.fieldValue);
+        if (!name || !value || /_af_image/i.test(name)) continue;
+        lines.push(`[FORM FIELD] ${name}: ${value}`);
+      }
+    }
+  } finally {
+    if (doc) await doc.destroy();
+  }
+
+  return normText(lines.join('\n'));
+}
+
+function detectType(text) {
+  if (/ELEVATOR\s+CALL\s+LOG/i.test(text)) return 'call_log';
+  if (/Incident\s+Report/i.test(text)) return 'incident_report';
   return 'generic';
 }
 
-function buildSummary(text,elevator,reference){
-  const sentences=text
-    .split(/(?<=[.!?])\s+/)
-    .map(s=>s.replace(/\s+/g,' ').trim())
-    .filter(s=>s.length>20&&/(elevator|cab|stuck|entrap|service|repair|kone|floor|released|out\s+of\s+service)/i.test(s));
-  let summary=sentences.slice(0,3).join(' ')||`Elevator incident reported. See attached PDF for full details.`;
-  if(elevator&&!new RegExp(`\\bElevator\\s+${elevator.replace('Elevator ','')}`,'i').test(summary)){
-    summary=`${elevator} incident. ${summary}`;
-  }
-  if(reference&&!summary.includes(reference)){
-    summary=`${summary} Reference: ${reference}.`;
-  }
-  return summary.replace(/\s+/g,' ').trim();
-}
+async function callOpenAI(text) {
+  const apiKey = (process.env.OPENAI_API_KEY || '').trim();
+  if (!apiKey) throw new Error('missing_key');
 
-// ── Local fallback parser ─────────────────────────────────────────────────────
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      temperature: 0,
+      max_tokens: 900,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: AI_SYSTEM_PROMPT },
+        { role: 'user', content: text.slice(0, 7000) }
+      ]
+    })
+  });
 
-function parseLocal(text){
-  const type=detectType(text);
-  const cab=extractCab(text);
-  const elevator=cabToElevator(cab)||'Elevator 1';
-  const reference=extractReference(text);
-  const date=getFirstDate(text)||new Date().toISOString().slice(0,10);
-
-  let building,issue,status,description,notes;
-
-  if(type==='incident_report'){
-    building=extractLocation(text)||extractClient(text)||'Unknown Location';
-    issue='Entrapment';
-    status=inferStatus(text,'incident_report');
-    const descBlock=text.match(/Description\s+of\s+Incident[^)]*\)\s*\n?([\s\S]+?)(?=Action|Emergency|Security\s+Officer)/i)?.[1]||'';
-    description=buildSummary(descBlock||text,elevator,reference);
-    const notesBlock=text.match(/Action\(s\)\s+Taken\s*\n?([\s\S]+?)(?=Emergency|Security\s+Officer|Police)/i)?.[1]||'';
-    notes=notesBlock.replace(/\s+/g,' ').trim().slice(0,300)||'No additional notes provided.';
-  } else if(type==='call_log'){
-    building=extractLocation(text)||'Unknown Location';
-    issue=inferIssue(text);
-    status=inferStatus(text,'call_log');
-    const descBlock=text.match(/DESCRIPTION\s+OF\s+THE\s+PROBLEM\s*[:\-]?\s*\n?([\s\S]+?)(?=ANYONE\s+TRAPPED|INJURIES|TIME\s+ELEVATOR)/i)?.[1]||'';
-    description=buildSummary(descBlock||text,elevator,reference);
-    const techBlock=text.match(/ELEVATOR\s+TECHNICIAN\s+SHOULD\s+ANSWER[^:]*:([\s\S]+?)(?=WN\d|$)/i)?.[1]||'';
-    notes=techBlock.replace(/\s+/g,' ').trim().slice(0,300)||'No additional notes provided.';
-  } else {
-    building=extractLocation(text)||extractClient(text)||'Unknown Location';
-    issue=inferIssue(text);
-    status='Open';
-    description=buildSummary(text,elevator,reference);
-    notes='No additional notes provided.';
-  }
-
-  console.log(`[local-parser] type=${type} cab=${cab} elevator=${elevator} issue=${issue} status=${status}`);
-
-  return {date,building,location:building,elevator,issue,status,description,notes,reference:reference||'N/A'};
-}
-
-// ── OpenAI call with retry ────────────────────────────────────────────────────
-
-async function callOpenAI(text){
-  const apiKey=(process.env.OPENAI_API_KEY||'').trim();
-  if(!apiKey)throw new Error('missing_key');
-
-  const payload={
-    model:OPENAI_MODEL,
-    max_tokens:800,
-    temperature:0,
-    response_format:{type:'json_object'},
-    messages:[
-      {role:'system',content:AI_SYSTEM_PROMPT},
-      {role:'user',content:text.slice(0,6000)}
-    ]
-  };
-
-  for(let attempt=0;attempt<3;attempt++){
-    const res=await fetch('https://api.openai.com/v1/chat/completions',{
-      method:'POST',
-      headers:{'content-type':'application/json','authorization':`Bearer ${apiKey}`},
-      body:JSON.stringify(payload)
-    });
-    if(res.ok){
-      const data=await res.json();
-      const raw=(data.choices?.[0]?.message?.content||'').trim();
-      if(!raw)throw new Error('openai_empty');
-      try{return JSON.parse(raw)}catch{
-        const s=raw.indexOf('{'),e=raw.lastIndexOf('}');
-        if(s<0||e<=s)throw new Error('openai_json_missing');
-        return JSON.parse(raw.slice(s,e+1));
-      }
-    }
-    if(res.status===429&&attempt<2){await sleep((attempt+1)*1500);continue;}
+  if (!res.ok) {
+    const errorText = await res.text().catch(() => '');
+    console.error(`OpenAI Error ${res.status}:`, errorText);
     throw new Error(`openai_${res.status}`);
   }
-  throw new Error('openai_429_exhausted');
+
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content?.trim() || '';
+  if (!raw) throw new Error('openai_empty');
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error('openai_json_invalid');
+  }
 }
 
-// ── Merge AI result with local extraction ─────────────────────────────────────
+// ── Local Fallback (kept as safety net) ─────────────────────────────────────
+function parseLocal(text) {
+  const normalized = normText(text);
+  const type = detectType(normalized);
+  const cab = extractCab(normalized);
+  const elevator = cabToElevator(cab) || 'Elevator 1';
+  const reference = extractReference(normalized);
+  const date = extractIncidentDate(normalized) || new Date().toISOString().slice(0, 10);
 
-function mergeWithLocal(aiResult,text){
-  const local=parseLocal(text);
-  const ai=aiResult||{};
+  if (type === 'incident_report') {
+    const building = extractBuilding(normalized) || 'Unknown Location';
+    const person = extractPersonInvolved(normalized);
+    const location = extractIncidentLocation(normalized) || building;
+    const actionNotes =
+      findFormFieldValue(normalized, 'Action\\s+Taken[^:]*Row1') ||
+      getSection(normalized, 'Action(s) Taken', ['Technician', 'Signature', 'Date']);
+    const description = buildIncidentDescription({
+      date,
+      person,
+      elevator,
+      building,
+      location,
+      reference
+    }) || `Incident involving ${elevator}. ${reference ? `Reference: ${reference}.` : ''}`.trim();
 
-  // Prefer AI for description/notes; prefer local CAB-derived elevator; take first non-empty for everything else
-  const pick=(a,b)=>(String(a||'').trim()||String(b||'').trim());
-
-  // Elevator: always re-derive from CAB in raw text for reliability
-  const cab=extractCab(text);
-  const elevator=cabToElevator(cab)||pick(ai.elevator,local.elevator)||'Elevator 1';
-
-  // Issue: Incident Report is always Entrapment regardless of AI
-  const type=detectType(text);
-  const aiIssue=findOptionMatch(ai.issue_type,ISSUES)||'';
-  const issue=type==='incident_report'
-    ?'Entrapment'
-    :((aiIssue&&aiIssue!=='Other')?aiIssue:(local.issue||aiIssue||'Other'));
-
-  const date=normalizeDate(pick(ai.date,local.date))||new Date().toISOString().slice(0,10);
-
-  // Building must be location value for this project.
-  const building=extractLocation(text)||pick(ai.building,local.building)||extractClient(text)||'Unknown Location';
-
-  const reference=extractReference(text)||'N/A';
-  const status=findOptionMatch(pick(ai.status,local.status),STATS)||local.status||'Open';
-
-  const rawDesc=String(ai.description||'').trim();
-  let description=rawDesc||local.description;
-  if(rawDesc){
-    if(elevator&&!new RegExp(`\\b${elevator.replace(/[.*+?^${}()|[\\]\\]/g,'\\$&')}\\b`,'i').test(description)){
-      description=`${elevator} incident. ${description}`.trim();
-    }
-    if(reference&&!new RegExp(reference.replace(/[.*+?^${}()|[\\]\\]/g,'\\$&'),'i').test(description)){
-      description=`${description} Reference: ${reference}.`.trim();
-    }
+    return {
+      date,
+      building,
+      location,
+      elevator,
+      issue: 'Entrapment',
+      status: /released safely|released without injury|rescued/i.test(normalized) ? 'Resolved' : 'Open',
+      description,
+      notes: pickRelevantSentences(actionNotes || normalized, 2) || 'No additional notes.',
+      reference: reference || 'N/A'
+    };
   }
 
-  const notes=String(ai.resolution_notes||'').trim()||local.notes||'No additional notes provided.';
+  if (type === 'call_log') {
+    const building = extractLocation(normalized) || 'Unknown Location';
+    const problemSection =
+      findFormFieldValue(normalized, 'DESCRIPTION\\s+OF\\s+THE\\s+PROBLEM(?!_2)') ||
+      getSection(normalized, 'DESCRIPTION OF THE PROBLEM', [
+        'FULL NAME OF THE ELEVATOR TECHNICIAN',
+        'ACTUAL TIME OF ARRIVAL',
+        'Technician notes',
+        'Action(s) Taken'
+      ]);
+    const techNotes =
+      findFormFieldValue(normalized, 'DESCRIPTION\\s+OF\\s+THE\\s+PROBLEM_2') ||
+      getSection(normalized, 'Technician notes', [
+        'FULL NAME OF THE ELEVATOR TECHNICIAN',
+        'ACTUAL TIME OF ARRIVAL',
+        'Action(s) Taken'
+      ]) ||
+      cleanExtractedValue(normalized.match(/Technician notes\s*[:\-]\s*(.+)/i)?.[1]);
+    const combined = `${problemSection} ${techNotes}`.trim();
+    const technician =
+      findFormFieldValue(normalized, 'FULL\\s+NAME\\s+OF\\s+THE\\s+ELEVATOR\\s+TECHNICIAN') ||
+      cleanExtractedValue(normalized.match(/FULL\s+NAME\s+OF\s+THE\s+ELEVATOR\s+TECHNICIAN\s*[:\-]\s*(.+)/i)?.[1]);
+    const arrival =
+      findFormFieldValue(normalized, 'ACTUAL\\s+TIME\\s+OF\\s+ARRIVAL') ||
+      cleanExtractedValue(normalized.match(/ACTUAL\s+TIME\s+OF\s+ARRIVAL\s*[:\-]\s*(.+)/i)?.[1]);
+    const issue = inferIssueFromText(combined || normalized);
+    const detail = pickRelevantSentences(combined || normalized, 2);
+    const description = [
+      elevator ? `${elevator} was reported at ${building}.` : `Incident reported at ${building}.`,
+      detail,
+      reference ? `Reference: ${reference}.` : ''
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    const notes = pickRelevantSentences([technician ? `Technician: ${technician}.` : '', techNotes].filter(Boolean).join(' '), 2) || 'No additional notes.';
 
-  console.log(`[merge] cab=${cab} elevator=${elevator} building=${building} issue=${issue} status=${status} ref=${reference}`);
+    return {
+      date,
+      building,
+      location: building,
+      elevator,
+      issue,
+      status: technician && arrival ? 'Resolved' : 'Open',
+      description,
+      notes,
+      reference: reference || 'N/A'
+    };
+  }
 
-  return {date,building,location:building,elevator,issue,status,description,notes,reference};
+  const building = extractBuilding(normalized) || 'Unknown Location';
+  const issue = inferIssueFromText(normalized);
+  const hasTechnician = /FULL\s+NAME\s+OF\s+THE\s+ELEVATOR\s+TECHNICIAN\s*[:\-]\s*.+/i.test(normalized);
+  const hasArrival = /ACTUAL\s+TIME\s+OF\s+ARRIVAL\s*[:\-]\s*\d{1,2}:\d{2}/i.test(normalized);
+
+  return {
+    date,
+    building,
+    location: building,
+    elevator,
+    issue,
+    status: hasTechnician && hasArrival ? 'Resolved' : 'Open',
+    description: pickRelevantSentences(normalized, 2) || `Incident involving ${elevator}.`,
+    notes: 'No additional notes.',
+    reference: reference || 'N/A'
+  };
 }
 
-// ── Route ─────────────────────────────────────────────────────────────────────
+// ── Merge Logic ─────────────────────────────────────────────────────────────
+function mergeWithLocal(aiResult, text) {
+  const local = parseLocal(text);
+  const ai = aiResult || {};
 
+  const cab = extractCab(text);
+  const elevator = cabToElevator(cab) || local.elevator || ai.elevator;
+
+  const type = detectType(text);
+  let issue = type === 'incident_report' ? 'Entrapment' : (local.issue || ai.issue_type);
+
+  const date = normalizeDate(local.date || ai.date) || new Date().toISOString().slice(0,10);
+  const building = extractBuilding(text) || local.building || ai.building || 'Unknown Location';
+  const reference = extractReference(text) || local.reference || 'N/A';
+  const status = findOptionMatch(local.status || ai.status, STATS) || 'Open';
+  const localShouldWin = /\[FORM FIELD\]/.test(text) || type === 'incident_report';
+
+  let description = localShouldWin
+    ? (local.description || String(ai.description || '').trim())
+    : (String(ai.description || '').trim() || local.description);
+  if (elevator && !description.includes(elevator)) {
+    description = `${elevator} incident. ${description}`;
+  }
+  if (reference && !description.includes(reference)) {
+    description = `${description} Reference: ${reference}.`;
+  }
+
+  const aiNotes = String(ai.resolution_notes || '').trim();
+  const notes = localShouldWin
+    ? (local.notes || aiNotes || 'No additional notes provided.')
+    : (aiNotes || local.notes || 'No additional notes provided.');
+
+  return { date, building, location: local.location || building, elevator, issue, status, description, notes, reference };
+}
+
+// ── Routes ─────────────────────────────────────────────────────────────────────
 app.use(express.static(__dirname));
 
-app.post('/api/pdf-import',upload.single('file'),async(req,res)=>{
-  try{
-    const file=req.file;
-    if(!file)return res.status(400).json({error:'No PDF uploaded.'});
-    if(file.mimetype!=='application/pdf'&&!/\.pdf$/i.test(file.originalname||''))
-      return res.status(400).json({error:'Only PDF files are supported.'});
+app.post('/api/pdf-import', upload.single('file'), async (req, res) => {
+  try {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No PDF uploaded.' });
 
-    const parsed=await pdfParse(file.buffer);
-    const rawText=normText(parsed.text||'');
-    if(!rawText)return res.status(422).json({error:'No text could be extracted from this PDF.'});
+    const parsed = await pdfParse(file.buffer);
+    const pageText = normText(parsed.text || '');
+    const formText = await extractPdfFormFieldText(file.buffer);
+    const rawText = normText([pageText, formText].filter(Boolean).join('\n'));
 
-    console.log(`[pdf-import] extracted ${rawText.length} chars, type=${detectType(rawText)}`);
+    if (!rawText) return res.status(422).json({ error: 'No text extracted.' });
 
-    let incident,warning='';
-    try{
-      const ai=await callOpenAI(rawText);
+    console.log(`[pdf-import] ${rawText.length} chars | ${formText ? 'form fields found' : 'no form fields'} | Type: ${detectType(rawText)}`);
+
+    let incident, warning = '';
+
+    try {
+      const ai = await callOpenAI(rawText);
       console.log('[pdf-import] AI succeeded');
-      incident=mergeWithLocal(ai,rawText);
-    }catch(err){
-      const msg=String(err.message||'');
-      console.warn(`[pdf-import] AI failed (${msg}), using local fallback`);
-      incident=parseLocal(rawText);
-      warning=`AI unavailable (${msg}); used local fallback.`;
+      incident = mergeWithLocal(ai, rawText);
+    } catch (err) {
+      console.error('[pdf-import] AI failed:', err.message);
+      incident = parseLocal(rawText);
+      warning = `AI unavailable (${err.message}); used local fallback.`;
     }
 
-    return res.json({incident,warning,rawText});
-  }catch(err){
-    console.error('[pdf-import] fatal',err.message);
-    return res.status(500).json({error:'Failed to process PDF: '+err.message});
+    res.json({ incident, warning, rawText: rawText.slice(0, 800) });
+  } catch (err) {
+    console.error('[pdf-import] fatal error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-const port=parseInt(process.env.PORT||'8080',10);
+const port = parseInt(process.env.PORT || '8080', 10);
 
-if(require.main===module){
-  app.listen(port,()=>console.log(`LiftLog server running at http://localhost:${port}`));
+if (require.main === module) {
+  app.listen(port, () => console.log(`LiftLog running on http://localhost:${port}`));
 }
 
-module.exports={
+module.exports = {
   parseLocal,
   mergeWithLocal,
+  extractPdfFormFieldText,
   detectType,
-  extractCab,
-  extractLocation,
-  extractReference,
-  getFirstDate,
   app
 };

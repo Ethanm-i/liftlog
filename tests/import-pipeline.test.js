@@ -21,11 +21,34 @@ Action(s) Taken: Security assisted and elevator was placed out of service.
 
   const incident=parseLocal(text);
   assert.strictEqual(incident.date,'2026-03-23');
-  assert.strictEqual(incident.building,'3060 Peachtree RD NW / 19th Floor');
+  assert.strictEqual(incident.building,'One Buckhead Plaza');
+  assert.strictEqual(incident.location,'3060 Peachtree RD NW / 19th Floor');
   assert.strictEqual(incident.elevator,'Elevator 10');
   assert.strictEqual(incident.issue,'Entrapment');
   assert.ok(incident.description.includes('#17542681'));
   assertNoEmpty(incident,'incident_report');
+}
+
+function testFillableIncidentReport(){
+  const text=`
+Incident Report
+[FORM FIELD] Date: 03/23/2026
+[FORM FIELD] Client: Cousins Properties
+[FORM FIELD] Location: Service Elevator Cab #10
+[FORM FIELD] Persons Involved NameDescriptionRow1: Eric Benitez
+[FORM FIELD] Description of Incident Explain in detail who what when and where Use other side if neededRow1: On March 23, 2026, Zacharias Martin called a Code Gold for elevator entrapment once it was discovered that Eric Benitez was stuck inside Service Elevator at One Buckhead Plaza on the 19th floor.
+[FORM FIELD] Action Taken Was incident resolvedRow1: A service request was created with KONE under reference number #17542681. ADOS Dunlap and Rover Officer Martin communicated with the entrapped until he was released.
+`;
+
+  const incident=parseLocal(text);
+  assert.strictEqual(incident.date,'2026-03-23');
+  assert.strictEqual(incident.building,'One Buckhead Plaza');
+  assert.strictEqual(incident.elevator,'Elevator 10');
+  assert.strictEqual(incident.issue,'Entrapment');
+  assert.ok(incident.description.includes('Eric Benitez'));
+  assert.ok(incident.description.includes('#17542681'));
+  assert.ok(incident.notes.includes('#17542681'));
+  assertNoEmpty(incident,'fillable_incident_report');
 }
 
 function testCallLog(){
@@ -50,6 +73,32 @@ Technician notes: Had to adjust the brake switch for elevator G.
   assert.strictEqual(incident.status,'Resolved');
   assert.ok(incident.description.includes('#17466105'));
   assertNoEmpty(incident,'call_log');
+}
+
+function testFillableCallLog(){
+  const text=`
+ELEVATOR CALL LOG
+LOCATION OF THE PROBLEM: _______________________ CAB #: _______________________________
+[FORM FIELD] CALLED IN BY: Danielle Pabon
+[FORM FIELD] DATE: 05/14/2026
+[FORM FIELD] TIME: 9:33 AM
+[FORM FIELD] LOCATION OF THE PROBLEM: 3060 Peachtree RD NW
+[FORM FIELD] CAB: G
+[FORM FIELD] DESCRIPTION OF THE PROBLEM: On Thursday, May 14, 2026, Deputy Assistant Director of Security Darrius Oliver observed that Elevator G was out of service on the 16th floor. No entrapments were reported. Security Rover Pabon contacted KONE Elevator Service regarding the issue and spoke with representative Chris, who generated service ticket reference #17466105 for repair dispatch.
+[FORM FIELD] ACTUAL TIME OF ARRIVAL: 6:43 am
+[FORM FIELD] DESCRIPTION OF THE PROBLEM_2: Had to adjust the break switch for elevator (G)
+[FORM FIELD] FULL NAME OF THE ELEVATOR TECHNICIAN: Eric Werlinger
+`;
+
+  const incident=parseLocal(text);
+  assert.strictEqual(incident.date,'2026-05-14');
+  assert.strictEqual(incident.building,'3060 Peachtree RD NW');
+  assert.strictEqual(incident.elevator,'Elevator G');
+  assert.strictEqual(incident.issue,'Mechanical Failure');
+  assert.strictEqual(incident.status,'Resolved');
+  assert.ok(incident.description.includes('#17466105'));
+  assert.ok(incident.notes.includes('Eric Werlinger'));
+  assertNoEmpty(incident,'fillable_call_log');
 }
 
 function testAiMergeRules(){
@@ -77,10 +126,42 @@ DESCRIPTION OF THE PROBLEM: Elevator was out of service. service ticket #1746610
   assertNoEmpty(merged,'ai_merge');
 }
 
+function testAiDoesNotOverrideFillableFields(){
+  const text=`
+Incident Report
+[FORM FIELD] Date: 03/23/2026
+[FORM FIELD] Client: Cousins Properties
+[FORM FIELD] Location: Service Elevator Cab #10
+[FORM FIELD] Persons Involved NameDescriptionRow1: Eric Benitez
+[FORM FIELD] Description of Incident Explain in detail who what when and where Use other side if neededRow1: On March 23, 2026, Eric Benitez was stuck inside Service Elevator at One Buckhead Plaza on the 19th floor.
+[FORM FIELD] Action Taken Was incident resolvedRow1: A service request was created with KONE under reference number #17542681.
+`;
+  const ai={
+    date:'2022-02-22',
+    building:'Client',
+    elevator:'Elevator A',
+    issue_type:'Entrapment',
+    status:'Open',
+    description:'Wrong AI summary.',
+    resolution_notes:'Wrong AI notes.'
+  };
+
+  const merged=mergeWithLocal(ai,text);
+  assert.strictEqual(merged.date,'2026-03-23');
+  assert.strictEqual(merged.building,'One Buckhead Plaza');
+  assert.strictEqual(merged.elevator,'Elevator 10');
+  assert.ok(merged.description.includes('Eric Benitez'));
+  assert.ok(merged.notes.includes('#17542681'));
+  assertNoEmpty(merged,'ai_fillable_guardrails');
+}
+
 function run(){
   testIncidentReport();
+  testFillableIncidentReport();
   testCallLog();
+  testFillableCallLog();
   testAiMergeRules();
+  testAiDoesNotOverrideFillableFields();
   console.log('All import pipeline tests passed.');
 }
 
