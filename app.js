@@ -138,6 +138,20 @@ function normalizeElevator(raw, mode='mixed'){
   return '';
 }
 
+function getElevatorUsage(rows){
+  const counts={};
+  rows.forEach(row=>{
+    const token=normalizeElevator(row.elevator)||String(row.elevator||'').replace(/^Elevator\s+/i,'').trim();
+    if(!token)return;
+    counts[token]=(counts[token]||0)+1;
+  });
+  const order=value=>{
+    const index=ELEVS.indexOf(value);
+    return index>=0?index:ELEVS.length;
+  };
+  return Object.entries(counts).sort((a,b)=>b[1]-a[1]||order(a[0])-order(b[0])||a[0].localeCompare(b[0]));
+}
+
 function findOptionMatch(raw, options){
   if(!raw)return '';
   const lowered=raw.toLowerCase();
@@ -731,12 +745,14 @@ function renderDash(){
   setText('k-ip',countWhere(data,row=>row.status==='In Progress'));
   setText('k-re',countWhere(data,row=>row.status==='Resolved'));
 
-  const ec={};ELEVS.forEach(l=>ec[l]=0);data.forEach(r=>ec[r.elevator]=(ec[r.elevator]||0)+1);
-  const top=Object.entries(ec).sort((a,b)=>b[1]-a[1])[0];
+  const elevatorUsage=getElevatorUsage(data);
+  const top=elevatorUsage[0];
   setText('top-elev',top&&top[1]>0?`${formatElevatorLabel(top[0])} - ${top[1]} incidents`:'No incidents yet');
 
-  const maxE=Math.max(1,...Object.values(ec));
-  setHtml('elev-bars',ELEVS.map(l=>`<div class="br"><div class="bl">${formatElevatorLabel(l)}</div><div class="bt"><div class="bf" style="width:${Math.round(ec[l]/maxE*100)}%"></div></div><div class="bc">${ec[l]}</div></div>`).join(''));
+  const maxE=Math.max(1,...elevatorUsage.map(([,v])=>v));
+  setHtml('elev-bars',elevatorUsage.length
+    ?elevatorUsage.map(([l,v])=>`<div class="br"><div class="bl">${formatElevatorLabel(l)}</div><div class="bt"><div class="bf" style="width:${Math.round(v/maxE*100)}%"></div></div><div class="bc">${v}</div></div>`).join('')
+    :'<div style="color:var(--tx3);font-size:13px;padding:6px">No elevator incidents recorded for this year.</div>');
 
   const ic={};ISSUES.forEach(t=>ic[t]=0);data.forEach(r=>ic[r.issue]=(ic[r.issue]||0)+1);
   drawPie(ic,data.length);
@@ -797,11 +813,10 @@ function renderTrap(){
   setText('tr-tot',data.length);
   setText('tr-op',countWhere(data,row=>row.status==='Open'));
   setText('tr-re',countWhere(data,row=>row.status==='Resolved'));
-  const ec={};ELEVS.forEach(l=>ec[l]=0);data.forEach(r=>ec[r.elevator]=(ec[r.elevator]||0)+1);
-  const nz=Object.entries(ec).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
-  const maxE=Math.max(1,...nz.map(([,v])=>v));
-  setHtml('trap-bars',nz.length
-    ?nz.map(([l,v])=>`<div class="br"><div class="bl">${formatElevatorLabel(l)}</div><div class="bt"><div class="bf re" style="width:${Math.round(v/maxE*100)}%"></div></div><div class="bc">${v}</div></div>`).join('')
+  const elevatorUsage=getElevatorUsage(data);
+  const maxE=Math.max(1,...elevatorUsage.map(([,v])=>v));
+  setHtml('trap-bars',elevatorUsage.length
+    ?elevatorUsage.map(([l,v])=>`<div class="br"><div class="bl">${formatElevatorLabel(l)}</div><div class="bt"><div class="bf re" style="width:${Math.round(v/maxE*100)}%"></div></div><div class="bc">${v}</div></div>`).join('')
     :'<div style="color:var(--tx3);font-size:13px;padding:6px">No entrapments recorded for this year.</div>');
   data.sort((a,b)=>b.date.localeCompare(a.date));
   setHtml('trap-body',data.length
