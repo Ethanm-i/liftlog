@@ -786,6 +786,47 @@ function drawPie(ic,tot){
 function bClass(i){const m={'Entrapment':'entr','Door Issue':'door','Mechanical Failure':'mech','Power Outage':'powr'};return'b-'+(m[i]||'othr')}
 function sClass(s){return s==='Open'?'b-open':s==='In Progress'?'b-prog':'b-res'}
 
+function updateIncidentStatus(id,status){
+  const data=load();
+  const incident=data.find(row=>row.id===id);
+  if(!incident)return;
+  const normalized=findOptionMatch(status,STATS);
+  if(!normalized||incident.status===normalized)return;
+  incident.status=normalized;
+  save(data);
+  showAddToast('ok',`Incident #${id} status updated to ${normalized}.`);
+  refresh();
+}
+
+function deleteIncident(id){
+  const data=load();
+  const incident=data.find(row=>row.id===id);
+  if(!incident)return;
+  const confirmed=window.confirm(`Delete incident #${id}? This cannot be undone.`);
+  if(!confirmed)return;
+  const updated=data.filter(row=>row.id!==id);
+  save(updated);
+  showAddToast('ok',`Incident #${id} deleted.`);
+  initYrDrop();
+  initFilters();
+  refresh();
+}
+
+function clearIncidentLog(){
+  const data=load();
+  if(!data.length){
+    showAddToast('info','Incident log is already empty.');
+    return;
+  }
+  const confirmed=window.confirm('Clear the entire incident log? This cannot be undone.');
+  if(!confirmed)return;
+  save([]);
+  showAddToast('ok','Incident log cleared.');
+  initYrDrop();
+  initFilters();
+  refresh();
+}
+
 //  Incident Log 
 function renderLog(){
   let data=load();
@@ -801,8 +842,8 @@ function renderLog(){
   data.sort((a,b)=>b.date.localeCompare(a.date));
   setText('log-cnt',data.length);
   setHtml('log-body',data.length
-    ?data.map(r=>`<tr><td>${r.id}</td><td>${r.date}</td><td>${r.building||'-'}</td><td>${formatElevatorLabel(r.elevator)}</td><td><span class="badge ${bClass(r.issue)}">${r.issue}</span></td><td style="max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.description||'').replace(/"/g,'&quot;')}">${r.description||'-'}</td><td><span class="badge ${sClass(r.status)}">${r.status}</span></td></tr>`).join('')
-    :`<tr><td colspan="7"><div class="nd"><i class="ti ti-mood-empty"></i>No incidents match your filters.</div></td></tr>`);
+    ?data.map(r=>`<tr><td>${r.id}</td><td>${r.date}</td><td>${r.building||'-'}</td><td>${formatElevatorLabel(r.elevator)}</td><td><span class="badge ${bClass(r.issue)}">${r.issue}</span></td><td class="log-desc">${r.description||'-'}</td><td><select class="status-edit ${sClass(r.status)}" aria-label="Update status for incident ${r.id}" onchange="updateIncidentStatus(${r.id},this.value)">${STATS.map(status=>`<option value="${status}" ${status===r.status?'selected':''}>${status}</option>`).join('')}</select></td><td><button type="button" class="row-del" aria-label="Delete incident ${r.id}" onclick="deleteIncident(${r.id})"><i class="ti ti-trash"></i>Delete</button></td></tr>`).join('')
+    :`<tr><td colspan="8"><div class="nd"><i class="ti ti-mood-empty"></i>No incidents match your filters.</div></td></tr>`);
 }
 
 //  Entrapment Tracker 
@@ -820,7 +861,7 @@ function renderTrap(){
     :'<div style="color:var(--tx3);font-size:13px;padding:6px">No entrapments recorded for this year.</div>');
   data.sort((a,b)=>b.date.localeCompare(a.date));
   setHtml('trap-body',data.length
-    ?data.map(r=>`<tr><td>${r.id}</td><td>${r.date}</td><td>${r.building||'-'}</td><td>${formatElevatorLabel(r.elevator)}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.description||'-'}</td><td><span class="badge ${sClass(r.status)}">${r.status}</span></td><td style="color:var(--tx3)">${r.notes||'-'}</td></tr>`).join('')
+    ?data.map(r=>`<tr><td>${r.id}</td><td>${r.date}</td><td>${r.building||'-'}</td><td>${formatElevatorLabel(r.elevator)}</td><td class="log-desc">${r.description||'-'}</td><td><span class="badge ${sClass(r.status)}">${r.status}</span></td><td class="log-notes">${r.notes||'-'}</td></tr>`).join('')
     :`<tr><td colspan="7"><div class="nd"><i class="ti ti-circle-check"></i>No entrapments this year.</div></td></tr>`);
 }
 
@@ -831,6 +872,63 @@ function renderDL(){
   setText('dl-tot',data.length);
   setText('dl-tr',countWhere(data,row=>row.issue==='Entrapment'));
   setText('dl-op',countWhere(data,row=>row.status==='Open'));
+}
+
+function estimateWrappedLineCount(text,colWidth){
+  const content=String(text||'');
+  if(!content)return 1;
+  const hardLines=content.split('\n');
+  return hardLines.reduce((total,line)=>{
+    const length=Math.max(1,line.length);
+    return total+Math.max(1,Math.ceil(length/Math.max(10,colWidth)));
+  },0);
+}
+
+function wrapTextForExcel(value,maxChars){
+  const content=String(value||'').replace(/\r/g,'').trim();
+  if(!content)return '';
+  return content
+    .split('\n')
+    .map(paragraph=>{
+      const words=paragraph.trim().split(/\s+/).filter(Boolean);
+      if(!words.length)return '';
+      const lines=[];
+      let line='';
+      words.forEach(word=>{
+        const next=line?`${line} ${word}`:word;
+        if(next.length<=maxChars){
+          line=next;
+        }else{
+          if(line)lines.push(line);
+          line=word;
+        }
+      });
+      if(line)lines.push(line);
+      return lines.join('\n');
+    })
+    .join('\n')
+    .trim();
+}
+
+function applyWrappedTextColumns(ws,rowCount,columnConfig){
+  if(!ws||!rowCount)return;
+  ws['!rows']=ws['!rows']||[];
+  ws['!rows'][0]={hpt:20};
+
+  for(let i=0;i<rowCount;i++){
+    const rowNumber=i+2;
+    let maxLines=1;
+
+    columnConfig.forEach(({col,width})=>{
+      const cellRef=`${col}${rowNumber}`;
+      const cell=ws[cellRef];
+      if(!cell)return;
+      cell.s={...(cell.s||{}),alignment:{...(cell.s?.alignment||{}),wrapText:true,vertical:'top'}};
+      maxLines=Math.max(maxLines,estimateWrappedLineCount(cell.v,width));
+    });
+
+    ws['!rows'][rowNumber-1]={hpt:Math.max(22,maxLines*13)};
+  }
 }
 
 //  Excel Export with embedded charts 
@@ -847,16 +945,18 @@ function exportXLSX(){
     const WB=XLSX.utils.book_new();
 
     //  Sheet 1: Incident Log 
-    const logRows=data.map(r=>({'ID':r.id,'Date':r.date,'Building':r.building||'','Elevator':formatElevatorLabel(r.elevator),'Issue Type':r.issue,'Description':r.description||'','Status':r.status,'Resolution Notes':r.notes||''}));
+  const logRows=data.map(r=>({'ID':r.id,'Date':r.date,'Building':r.building||'','Elevator':formatElevatorLabel(r.elevator),'Issue Type':r.issue,'Description':wrapTextForExcel(r.description||'',56),'Status':r.status,'Resolution Notes':wrapTextForExcel(r.notes||'',46)}));
     const wsLog=XLSX.utils.json_to_sheet(logRows.length?logRows:[{'Note':'No incidents for '+yr}]);
-    wsLog['!cols']=[{wch:6},{wch:12},{wch:20},{wch:13},{wch:20},{wch:42},{wch:14},{wch:30}];
+    wsLog['!cols']=[{wch:6},{wch:12},{wch:20},{wch:13},{wch:20},{wch:56},{wch:14},{wch:44}];
+    applyWrappedTextColumns(wsLog,logRows.length,[{col:'F',width:56},{col:'H',width:44}]);
     wsLog['!freeze']={xSplit:0,ySplit:1};
     XLSX.utils.book_append_sheet(WB,wsLog,'Incident_Log');
 
     //  Sheet 2: Entrapments 
-    const trapRows=data.filter(r=>r.issue==='Entrapment').map(r=>({'ID':r.id,'Date':r.date,'Building':r.building||'','Elevator':formatElevatorLabel(r.elevator),'Description':r.description||'','Status':r.status,'Resolution Notes':r.notes||''}));
+    const trapRows=data.filter(r=>r.issue==='Entrapment').map(r=>({'ID':r.id,'Date':r.date,'Building':r.building||'','Elevator':formatElevatorLabel(r.elevator),'Description':wrapTextForExcel(r.description||'',56),'Status':r.status,'Resolution Notes':wrapTextForExcel(r.notes||'',46)}));
     const wsTrap=XLSX.utils.json_to_sheet(trapRows.length?trapRows:[{'Note':'No entrapments for '+yr}]);
-    wsTrap['!cols']=[{wch:6},{wch:12},{wch:20},{wch:13},{wch:42},{wch:14},{wch:30}];
+    wsTrap['!cols']=[{wch:6},{wch:12},{wch:20},{wch:13},{wch:56},{wch:14},{wch:44}];
+    applyWrappedTextColumns(wsTrap,trapRows.length,[{col:'E',width:56},{col:'G',width:44}]);
     XLSX.utils.book_append_sheet(WB,wsTrap,'Entrapments');
 
     //  Sheet 3: Monthly Summary 
@@ -871,50 +971,77 @@ function exportXLSX(){
     const ic={};ISSUES.forEach(t=>ic[t]=0);data.forEach(r=>ic[r.issue]=(ic[r.issue]||0)+1);
     const mCounts=Object.values(mc).map(r=>r['Total Incidents']);
 
+    const activeElevators=Object.entries(ec)
+      .filter(([,count])=>count>0)
+      .sort((a,b)=>b[1]-a[1]||ELEVS.indexOf(a[0])-ELEVS.indexOf(b[0]));
+    const elevatorChartRows=(activeElevators.length?activeElevators:Object.entries(ec).slice(0,8)).slice(0,12);
+    const issueSummary=Object.entries(ic)
+      .sort((a,b)=>b[1]-a[1]||ISSUES.indexOf(a[0])-ISSUES.indexOf(b[0]));
+    const issueChartRows=issueSummary.filter(([,count])=>count>0);
+    if(!issueChartRows.length)issueChartRows.push(['No incidents',1]);
+
     // Chart data sheet layout:
-    // A1:B53  = Elevator data (label | count)
-    // C1:D8   = Issue type data (label | count)
+    // A1:B13  = Top elevator data (label | count)
+    // C1:D?   = Active issue type data (label | count)
     // E1:F13  = Monthly trend data (label | count)
-    const chartRows=Math.max(ELEVS.length,ISSUES.length,MOS.length);
+    const chartRows=Math.max(elevatorChartRows.length,issueChartRows.length,MOS.length);
     const chartDataAoA=[['Elevator','Incidents','Issue Type','Count','Month','Incidents']];
     for(let i=0;i<chartRows;i++){
       chartDataAoA.push([
-        ELEVS[i]?formatElevatorLabel(ELEVS[i]):'',
-        ELEVS[i]?ec[ELEVS[i]]:'',
-        ISSUES[i]||'',
-        ISSUES[i]?ic[ISSUES[i]]:'',
+        elevatorChartRows[i]?formatElevatorLabel(elevatorChartRows[i][0]):'',
+        elevatorChartRows[i]?elevatorChartRows[i][1]:'',
+        issueChartRows[i]?issueChartRows[i][0]:'',
+        issueChartRows[i]?issueChartRows[i][1]:'',
         MOS[i]||'',
         typeof mCounts[i]==='number'?mCounts[i]:''
       ]);
     }
     const wsCD=XLSX.utils.aoa_to_sheet(chartDataAoA);
-    wsCD['!cols']=[{wch:14},{wch:10},{wch:2},{wch:20},{wch:10},{wch:2},{wch:10},{wch:10}];
+    wsCD['!cols']=[{wch:20},{wch:10},{wch:20},{wch:10},{wch:10},{wch:10}];
     XLSX.utils.book_append_sheet(WB,wsCD,'Chart_Data');
 
     //  Sheet 5: Dashboard (KPIs + charts anchored here) 
     const trap=data.filter(r=>r.issue==='Entrapment').length;
-    const topE=Object.entries(ec).sort((a,b)=>b[1]-a[1])[0];
+    const topE=(activeElevators[0]||Object.entries(ec).sort((a,b)=>b[1]-a[1])[0]);
+    const topElevatorsTable=[...elevatorChartRows];
+    while(topElevatorsTable.length<6)topElevatorsTable.push(['', '']);
+    const issueTable=[...issueSummary.slice(0,6)];
+    while(issueTable.length<6)issueTable.push(['', '']);
     const dashAoA=[
-      [`LiftLog Annual Report - ${yr}`,'','','','','','','','','','','','','','',''],
-      [''],
-      ['METRIC','VALUE'],
-      ['Total Incidents',data.length],
-      ['Entrapments',trap],
-      ['Other Incidents',data.length-trap],
-      ['Open Cases',data.filter(r=>r.status==='Open').length],
-      ['In Progress',data.filter(r=>r.status==='In Progress').length],
-      ['Resolved',data.filter(r=>r.status==='Resolved').length],
-      ['Elevator With Most Incidents',topE&&topE[1]>0?`${formatElevatorLabel(topE[0])} (${topE[1]} incidents)`:'N/A'],
+      [`LiftLog Annual Report - ${yr}`,'','','','','','',''],
+      [`Generated: ${new Date().toLocaleString()}`,'','','','','','',''],
+      ['','','','','','','',''],
+      ['METRIC','VALUE','','Top Elevators','Incidents','','Issue Breakdown','Count'],
+      ['Total Incidents',data.length,'',topElevatorsTable[0][0]?formatElevatorLabel(topElevatorsTable[0][0]):'',topElevatorsTable[0][1],'',issueTable[0][0],issueTable[0][1]],
+      ['Entrapments',trap,'',topElevatorsTable[1][0]?formatElevatorLabel(topElevatorsTable[1][0]):'',topElevatorsTable[1][1],'',issueTable[1][0],issueTable[1][1]],
+      ['Other Incidents',data.length-trap,'',topElevatorsTable[2][0]?formatElevatorLabel(topElevatorsTable[2][0]):'',topElevatorsTable[2][1],'',issueTable[2][0],issueTable[2][1]],
+      ['Open Cases',data.filter(r=>r.status==='Open').length,'',topElevatorsTable[3][0]?formatElevatorLabel(topElevatorsTable[3][0]):'',topElevatorsTable[3][1],'',issueTable[3][0],issueTable[3][1]],
+      ['In Progress',data.filter(r=>r.status==='In Progress').length,'',topElevatorsTable[4][0]?formatElevatorLabel(topElevatorsTable[4][0]):'',topElevatorsTable[4][1],'',issueTable[4][0],issueTable[4][1]],
+      ['Resolved',data.filter(r=>r.status==='Resolved').length,'',topElevatorsTable[5][0]?formatElevatorLabel(topElevatorsTable[5][0]):'',topElevatorsTable[5][1],'',issueTable[5][0],issueTable[5][1]],
+      ['Elevator With Most Incidents',topE&&topE[1]>0?`${formatElevatorLabel(topE[0])} (${topE[1]} incidents)`:'N/A','','','','','',''],
     ];
     const wsDash=XLSX.utils.aoa_to_sheet(dashAoA);
-    wsDash['!cols']=[{wch:30},{wch:22},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2},{wch:2}];
+    wsDash['!cols']=[{wch:34},{wch:24},{wch:3},{wch:24},{wch:11},{wch:3},{wch:22},{wch:10}];
+    wsDash['!merges']=[{s:{r:0,c:0},e:{r:0,c:7}},{s:{r:1,c:0},e:{r:1,c:7}}];
+    wsDash['!rows']=[{hpt:26},{hpt:20},{hpt:8},{hpt:20}];
+
+    const dashTitleStyle={font:{bold:true,sz:15,color:{rgb:'1F2937'}},alignment:{horizontal:'left',vertical:'center'}};
+    const dashSubTitleStyle={font:{bold:false,sz:10,color:{rgb:'6B7280'}},alignment:{horizontal:'left',vertical:'center'}};
+    const dashHeaderStyle={font:{bold:true,color:{rgb:'FFFFFF'}},fill:{fgColor:{rgb:'374151'}},alignment:{horizontal:'left',vertical:'center'}};
+    const dashValueStyle={alignment:{horizontal:'right',vertical:'center'}};
+
+    if(wsDash.A1)wsDash.A1.s=dashTitleStyle;
+    if(wsDash.A2)wsDash.A2.s=dashSubTitleStyle;
+    ['A4','B4','D4','E4','G4','H4'].forEach(cell=>{if(wsDash[cell])wsDash[cell].s=dashHeaderStyle;});
+    ['B5','B6','B7','B8','B9','B10','E5','E6','E7','E8','E9','E10','H5','H6','H7','H8','H9','H10'].forEach(cell=>{if(wsDash[cell])wsDash[cell].s=dashValueStyle;});
     XLSX.utils.book_append_sheet(WB,wsDash,'Dashboard');
 
     // SheetJS can write sheets quickly, but embedded charts need manual OpenXML parts.
     // We patch the generated .xlsx zip with drawing/chart XML and relationships.
 
-    const elevEndRow=ELEVS.length+1;
-    // Bar chart: Incidents by Elevator (Chart_Data A2:B53)
+    const elevEndRow=elevatorChartRows.length+1;
+    const issueEndRow=issueChartRows.length+1;
+    // Bar chart: Incidents by Elevator (Chart_Data A2:B?)
     const barChartXml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -937,11 +1064,11 @@ function exportXLSX(){
       <c:catAx><c:axId val="1"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="b"/><c:crossAx val="2"/></c:catAx>
       <c:valAx><c:axId val="2"/><c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/><c:axPos val="l"/><c:crossAx val="1"/></c:valAx>
     </c:plotArea>
-    <c:legend><c:legendPos val="b"/></c:legend>
+    <c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend>
   </c:chart>
 </c:chartSpace>`;
 
-    // Pie chart: Issue Type Breakdown (Chart_Data C2:D8)
+    // Pie chart: Issue Type Breakdown (Chart_Data C2:D?)
     const pieChartXml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -954,13 +1081,13 @@ function exportXLSX(){
         <c:ser>
           <c:idx val="0"/><c:order val="0"/>
           <c:tx><c:strRef><c:f>Chart_Data!$D$1</c:f></c:strRef></c:tx>
-          <c:cat><c:strRef><c:f>Chart_Data!$C$2:$C$8</c:f></c:strRef></c:cat>
-          <c:val><c:numRef><c:f>Chart_Data!$D$2:$D$8</c:f></c:numRef></c:val>
+          <c:cat><c:strRef><c:f>Chart_Data!$C$2:$C$${issueEndRow}</c:f></c:strRef></c:cat>
+          <c:val><c:numRef><c:f>Chart_Data!$D$2:$D$${issueEndRow}</c:f></c:numRef></c:val>
         </c:ser>
         <c:firstSliceAng val="0"/>
       </c:pieChart>
     </c:plotArea>
-    <c:legend><c:legendPos val="r"/></c:legend>
+    <c:legend><c:legendPos val="b"/></c:legend>
   </c:chart>
 </c:chartSpace>`;
 
@@ -1042,7 +1169,7 @@ function exportXLSX(){
 </Relationships>`;
 
     // Write base workbook, then reopen as zip for chart/drawing injection.
-    const wbOut=XLSX.write(WB,{type:'binary',bookType:'xlsx'});
+    const wbOut=XLSX.write(WB,{type:'binary',bookType:'xlsx',cellStyles:true});
 
       // Convert binary string  Uint8Array for JSZip
       // I need to come back to this 
@@ -1133,6 +1260,287 @@ function exportCSV(){
   const rows=data.map(r=>[r.id,r.date,esc(r.building||''),formatElevatorLabel(r.elevator),r.issue,esc(r.description||''),r.status,esc(r.notes||'')]);
   const csv=[hdr.join(','),...rows.map(r=>r.join(','))].join('\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=`LiftLog_${yr}.csv`;a.click();
+}
+
+async function exportPDF(){
+  const yr=getYr();
+  const data=getIncidentsByYear(yr).sort((a,b)=>b.date.localeCompare(a.date));
+  const entrapments=data.filter(row=>row.issue==='Entrapment');
+  const btn=$('pdf-btn');
+  const status=$('xl-status');
+  btn.disabled=true;
+  status.className='xl-status loading';
+  status.textContent='Building PDF report...';
+
+  try{
+    if(!window.jspdf||typeof window.jspdf.jsPDF!=='function'){
+      throw new Error('PDF library is unavailable. Refresh the page and try again.');
+    }
+
+    const {jsPDF}=window.jspdf;
+    const doc=new jsPDF({orientation:'landscape',unit:'pt',format:'a4'});
+
+    const title=`LiftLog Annual Report - ${yr}`;
+    const generated=`Generated: ${new Date().toLocaleString()}`;
+    const metricRows=[
+      ['Total Incidents',String(data.length)],
+      ['Entrapments',String(countWhere(data,row=>row.issue==='Entrapment'))],
+      ['Other Incidents',String(countWhere(data,row=>row.issue!=='Entrapment'))],
+      ['Open Cases',String(countWhere(data,row=>row.status==='Open'))],
+      ['In Progress',String(countWhere(data,row=>row.status==='In Progress'))],
+      ['Resolved',String(countWhere(data,row=>row.status==='Resolved'))]
+    ];
+
+    const elevatorCounts={};
+    ELEVS.forEach(elevator=>{elevatorCounts[elevator]=0;});
+    data.forEach(row=>{
+      if(elevatorCounts[row.elevator]!==undefined)elevatorCounts[row.elevator]+=1;
+    });
+
+    const issueCounts={};
+    ISSUES.forEach(issue=>{issueCounts[issue]=0;});
+    data.forEach(row=>{issueCounts[row.issue]=(issueCounts[row.issue]||0)+1;});
+
+    const monthlyCounts=MOS.map((_,index)=>countWhere(data,row=>parseInt(row.date.slice(5,7),10)-1===index));
+    const topElevator=Object.entries(elevatorCounts).sort((a,b)=>b[1]-a[1])[0];
+    const topElevatorLabel=topElevator&&topElevator[1]>0?`${formatElevatorLabel(topElevator[0])} (${topElevator[1]} incidents)`:'N/A';
+    metricRows.push(['Elevator With Most Incidents',topElevatorLabel]);
+
+    function drawCard(x,y,w,h,titleText){
+      doc.setDrawColor(180,180,180);
+      doc.setFillColor(255,255,255);
+      doc.roundedRect(x,y,w,h,8,8,'FD');
+      doc.setFontSize(11);
+      doc.setTextColor(20,20,20);
+      doc.text(titleText,x+12,y+18);
+    }
+
+    function drawBarChart(x,y,w,h,labels,values,color){
+      const chartPad={left:30,right:10,top:18,bottom:28};
+      const innerW=w-chartPad.left-chartPad.right;
+      const innerH=h-chartPad.top-chartPad.bottom;
+      const maxVal=Math.max(1,...values);
+      const barW=Math.max(12,innerW/Math.max(1,labels.length)-10);
+
+      doc.setDrawColor(200,200,200);
+      doc.line(x+chartPad.left,y+chartPad.top,x+chartPad.left,y+chartPad.top+innerH);
+      doc.line(x+chartPad.left,y+chartPad.top+innerH,x+chartPad.left+innerW,y+chartPad.top+innerH);
+
+      labels.forEach((label,index)=>{
+        const value=values[index]||0;
+        const barH=(value/maxVal)*innerH;
+        const barX=x+chartPad.left+index*(barW+8)+4;
+        const barY=y+chartPad.top+innerH-barH;
+
+        doc.setFillColor(color[0],color[1],color[2]);
+        doc.rect(barX,barY,barW,barH,'F');
+        doc.setFontSize(7);
+        doc.setTextColor(60,60,60);
+        doc.text(String(label),barX+barW/2,y+chartPad.top+innerH+12,{align:'center',angle:35});
+      });
+    }
+
+    function drawPieChart(cx,cy,r,entries){
+      const total=Math.max(1,entries.reduce((sum,entry)=>sum+entry.value,0));
+      let angle=-Math.PI/2;
+
+      entries.forEach((entry,index)=>{
+        const slice=(entry.value/total)*Math.PI*2;
+        const end=angle+slice;
+        const color=entry.color;
+        const points=[[cx,cy]];
+        const segments=Math.max(6,Math.ceil(slice/(Math.PI/12)));
+
+        for(let i=0;i<=segments;i++){
+          const t=angle+(slice*i/segments);
+          points.push([cx+Math.cos(t)*r,cy+Math.sin(t)*r]);
+        }
+
+        doc.setFillColor(color[0],color[1],color[2]);
+        doc.setDrawColor(255,255,255);
+        doc.lines(points.slice(1).map((point,pointIndex)=>{
+          if(pointIndex===0)return [point[0]-cx,point[1]-cy];
+          return [point[0]-points[pointIndex+1][0],point[1]-points[pointIndex+1][1]];
+        }),cx,cy,[1,1],'F',true);
+
+        angle=end;
+      });
+
+      doc.setFillColor(255,255,255);
+      doc.circle(cx,cy,r*0.45,'F');
+
+      let legendY=cy+r+12;
+      entries.forEach(entry=>{
+        doc.setFillColor(entry.color[0],entry.color[1],entry.color[2]);
+        doc.rect(cx-r,legendY-6,8,8,'F');
+        doc.setFontSize(8);
+        doc.setTextColor(40,40,40);
+        doc.text(`${entry.label} (${entry.value})`,cx-r+12,legendY+1);
+        legendY+=12;
+      });
+    }
+
+    function drawLineChart(x,y,w,h,labels,values,color){
+      const chartPad={left:22,right:10,top:16,bottom:20};
+      const innerW=w-chartPad.left-chartPad.right;
+      const innerH=h-chartPad.top-chartPad.bottom;
+      const maxVal=Math.max(1,...values);
+      const stepX=labels.length>1?innerW/(labels.length-1):innerW;
+
+      doc.setDrawColor(200,200,200);
+      doc.line(x+chartPad.left,y+chartPad.top,x+chartPad.left,y+chartPad.top+innerH);
+      doc.line(x+chartPad.left,y+chartPad.top+innerH,x+chartPad.left+innerW,y+chartPad.top+innerH);
+
+      doc.setDrawColor(color[0],color[1],color[2]);
+      for(let i=0;i<labels.length;i++){
+        const px=x+chartPad.left+i*stepX;
+        const py=y+chartPad.top+innerH-(values[i]/maxVal)*innerH;
+        if(i>0){
+          const prevX=x+chartPad.left+(i-1)*stepX;
+          const prevY=y+chartPad.top+innerH-(values[i-1]/maxVal)*innerH;
+          doc.line(prevX,prevY,px,py);
+        }
+        doc.setFillColor(color[0],color[1],color[2]);
+        doc.circle(px,py,2.2,'F');
+        doc.setFontSize(7);
+        doc.setTextColor(70,70,70);
+        doc.text(labels[i],px,y+chartPad.top+innerH+11,{align:'center'});
+      }
+    }
+
+    doc.setFontSize(16);
+    doc.setTextColor(20,20,20);
+    doc.text(title,30,30);
+    doc.setFontSize(9);
+    doc.setTextColor(80,80,80);
+    doc.text(generated,30,44);
+
+    doc.autoTable({
+      head:[['METRIC','VALUE']],
+      body:metricRows,
+      startY:56,
+      margin:{left:30,right:0},
+      tableWidth:320,
+      styles:{fontSize:8,cellPadding:4,overflow:'linebreak'},
+      headStyles:{fillColor:[31,41,55],textColor:[255,255,255]},
+      columnStyles:{0:{cellWidth:220},1:{cellWidth:100}}
+    });
+
+    const activeElevators=Object.entries(elevatorCounts)
+      .filter(([,count])=>count>0)
+      .sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]))
+      .slice(0,10);
+    const barLabels=(activeElevators.length?activeElevators:Object.entries(elevatorCounts).slice(0,8)).map(([elevator])=>formatElevatorLabel(elevator));
+    const barValues=(activeElevators.length?activeElevators:Object.entries(elevatorCounts).slice(0,8)).map(([,count])=>count);
+
+    const pieColors=[
+      [59,130,246],[244,114,182],[34,197,94],[234,179,8],[99,102,241],[251,146,60],[107,114,128]
+    ];
+    const pieEntries=ISSUES
+      .map((issue,index)=>({label:issue,value:issueCounts[issue]||0,color:pieColors[index%pieColors.length]}))
+      .filter(entry=>entry.value>0);
+
+    drawCard(365,56,430,230,'Incidents by Issue Type');
+    if(pieEntries.length){
+      drawPieChart(575,158,74,pieEntries);
+    }else{
+      doc.setFontSize(9);
+      doc.setTextColor(110,110,110);
+      doc.text('No issue data for selected year.',500,165);
+    }
+
+    drawCard(30,245,765,250,'Incidents by Elevator');
+    drawBarChart(42,275,740,200,barLabels,barValues,[59,130,246]);
+
+    drawCard(365,505,430,85,'Monthly Incident Trend');
+    drawLineChart(377,526,405,50,MOS,monthlyCounts,[16,185,129]);
+
+    doc.addPage('a4','landscape');
+    doc.setFontSize(14);
+    doc.setTextColor(20,20,20);
+    doc.text(`Incident Log - ${yr}`,30,32);
+    doc.setFontSize(9);
+    doc.setTextColor(80,80,80);
+    doc.text(generated,30,46);
+
+    const head=[['ID','Date','Building','Elevator','Issue Type','Description','Status','Resolution Notes']];
+    const body=data.map(row=>[
+      row.id,
+      row.date,
+      row.building||'',
+      formatElevatorLabel(row.elevator),
+      row.issue||'',
+      row.description||'',
+      row.status||'',
+      row.notes||''
+    ]);
+
+    doc.autoTable({
+      head,
+      body:body.length?body:[['','','','','','No incidents for selected year.','','']],
+      startY:56,
+      margin:{left:24,right:24},
+      styles:{fontSize:8,cellPadding:4,overflow:'linebreak',valign:'top'},
+      headStyles:{fillColor:[55,65,81],textColor:[255,255,255]},
+      columnStyles:{
+        0:{cellWidth:28},
+        1:{cellWidth:56},
+        2:{cellWidth:92},
+        3:{cellWidth:62},
+        4:{cellWidth:80},
+        5:{cellWidth:180},
+        6:{cellWidth:60},
+        7:{cellWidth:170}
+      }
+    });
+
+    doc.addPage('a4','landscape');
+    doc.setFontSize(14);
+    doc.setTextColor(20,20,20);
+    doc.text(`Entrapment Log - ${yr}`,30,32);
+    doc.setFontSize(9);
+    doc.setTextColor(80,80,80);
+    doc.text(generated,30,46);
+
+    const trapBody=entrapments.map(row=>[
+      row.id,
+      row.date,
+      row.building||'',
+      formatElevatorLabel(row.elevator),
+      row.issue||'',
+      row.description||'',
+      row.status||'',
+      row.notes||''
+    ]);
+
+    doc.autoTable({
+      head,
+      body:trapBody.length?trapBody:[['','','','','','No entrapments for selected year.','','']],
+      startY:56,
+      margin:{left:24,right:24},
+      styles:{fontSize:8,cellPadding:4,overflow:'linebreak',valign:'top'},
+      headStyles:{fillColor:[185,28,28],textColor:[255,255,255]},
+      columnStyles:{
+        0:{cellWidth:28},
+        1:{cellWidth:56},
+        2:{cellWidth:92},
+        3:{cellWidth:62},
+        4:{cellWidth:80},
+        5:{cellWidth:180},
+        6:{cellWidth:60},
+        7:{cellWidth:170}
+      }
+    });
+
+    doc.save(`LiftLog_${yr}_Report.pdf`);
+    status.className='xl-status done';
+    status.textContent=`LiftLog_${yr}_Report.pdf downloaded (dashboard + log pages).`;
+  }catch(error){
+    status.className='xl-status fail';
+    status.textContent='PDF export failed: '+error.message;
+  }finally{
+    btn.disabled=false;
+  }
 }
 
 //  Save Incident 

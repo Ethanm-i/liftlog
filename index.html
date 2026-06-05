@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LiftLog - Elevator Incident Tracker</title>
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.10.0/dist/tabler-icons.min.css">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
@@ -111,10 +113,11 @@
         <select id="lf-is" onchange="renderLog()"><option value="">All Issue Types</option></select>
         <select id="lf-st" onchange="renderLog()"><option value="">All Statuses</option></select>
         <input type="text" id="lf-q" placeholder="Search description..." oninput="renderLog()" style="min-width:160px">
+        <button class="btn-s btn-danger" type="button" onclick="clearIncidentLog()"><i class="ti ti-trash"></i>Clear Incident Log</button>
       </div>
       <div class="tw">
         <table>
-          <thead><tr><th>#</th><th>Date</th><th>Building</th><th>Elevator</th><th>Issue Type</th><th>Description</th><th>Status</th></tr></thead>
+          <thead><tr><th>#</th><th>Date</th><th>Building</th><th>Elevator</th><th>Issue Type</th><th>Description</th><th>Status</th><th>Action</th></tr></thead>
           <tbody id="log-body"></tbody>
         </table>
       </div>
@@ -155,17 +158,20 @@
         <div class="dlm"><div class="v" id="dl-op">0</div><div class="l">Open Cases</div></div>
       </div>
       <div class="dl-card">
-        <h3>Workbook includes 5 sheets</h3>
-        <ul class="dl-list">
-          <li><i class="ti ti-table"></i>Incident_Log - every incident with all fields, frozen header</li>
-          <li><i class="ti ti-alert-triangle"></i>Entrapments - filtered entrapment records only</li>
-          <li><i class="ti ti-calendar-stats"></i>Monthly_Summary - month-by-month counts with totals</li>
-          <li><i class="ti ti-chart-bar"></i>Dashboard - KPI summary + 3 embedded Excel charts</li>
-          <li><i class="ti ti-database"></i>Chart_Data - source data powering the charts</li>
-        </ul>
-        <div class="btns-row">
-          <button class="btn-p" id="xl-btn" onclick="exportXLSX()"><i class="ti ti-file-spreadsheet"></i>Download Excel (.xlsx)</button>
-          <button class="btn-s" onclick="exportCSV()"><i class="ti ti-file-text"></i>Download CSV (fallback)</button>
+        <div class="dl-creative-shell">
+          <div class="dl-creative-glow"></div>
+          <div class="dl-creative-copy">
+            <h3>Annual Workbook Export</h3>
+            <p>Generate a clean Excel report for the selected year with dashboard visuals and organized data tabs.</p>
+            <div class="dl-chip-row">
+              <span class="dl-chip"><i class="ti ti-chart-bar"></i>Dashboard Charts</span>
+              <span class="dl-chip"><i class="ti ti-table"></i>Incident Log</span>
+              <span class="dl-chip"><i class="ti ti-calendar-stats"></i>Monthly Summary</span>
+            </div>
+          </div>
+          <div class="dl-creative-action">
+            <button class="btn-p" id="xl-btn" onclick="exportXLSX()"><i class="ti ti-file-spreadsheet"></i>Download Excel (.xlsx)</button>
+          </div>
         </div>
         <div class="xl-status" id="xl-status"></div>
       </div>
